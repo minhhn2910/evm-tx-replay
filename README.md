@@ -1,6 +1,6 @@
-# EVM Tx Extraction for replaying in EVM executables
+# Extract historical transaction data for replay on EVM executables
 
-A tool for extracting Ethereum transaction data from mainnet that can be simulated/replay on any EVM executables. This tool generates JSON files conforming to the [eth-tests json](https://github.com/ethereum/legacytests/tree/1f581b8ccdc4c63acf5f2c5c1b155c690c32a8eb/Cancun/GeneralStateTests) EVM test format with minimal state, enabling simulation of mainnet transactions from any EVM implementation(e.g. used as an input for geth's`evm --json` command or exporting trace to be used in [`goevmlab` tools](https://github.com/holiman/goevmlab.git)).
+A tool for extracting Ethereum transaction data from mainnet that can be simulated/replay on any EVM executables. This tool generates JSON files conforming to the [eth-tests json](https://github.com/ethereum/legacytests/tree/1f581b8ccdc4c63acf5f2c5c1b155c690c32a8eb/Cancun/GeneralStateTests) EVM test format with minimal state, enabling simulation of mainnet transactions from any EVM implementation(e.g. used as an input for geth's`evm --json statetest` command or exporting trace to be used in [`goevmlab` tools](https://github.com/holiman/goevmlab.git)).
 
 ## Features
 
@@ -27,8 +27,8 @@ The `txTest.json` contains the minimal set of storage slots and prestate's balan
 
 ```bash
 # Clone the repository
-git clone https://github.com/minhhn2910/EVM-tx-extract.git
-cd EVM-tx-extract
+git clone https://github.com/minhhn2910/evm-tx-replay.git
+cd evm-tx-replay
 
 # Install dependencies
 pip install -r requirements.txt
@@ -41,7 +41,7 @@ pip install -e .
 
 ```bash
 # Collect a single transaction
-python main.py --tx 0xd4146e7616a3fb40a57537f43f232ce65eaca9442b9b5a3bbf4f486683159c26
+python main.py --tx 0x88244bc267fb3fafd5333bb4f707d0905c0893026534332b7ea269849531991b
 
 # Using a custom RPC endpoint
 python main.py --endpoint http://localhost:8545 --tx 0x8b6b...
@@ -100,13 +100,9 @@ Contains complete transaction environment and state:
 {
   "envinfo": {
     "env": {
-      "currentBaseFee": "0x...",
-      "currentCoinbase": "0x...",
-      "currentDifficulty": "0x...",
-      "currentGasLimit": "0x...",
       "currentNumber": "0x...",
       "currentTimestamp": "0x...",
-      "previousHash": "0x..."
+      ...
     },
     "transaction": {
       "data": ["0x..."],
@@ -125,6 +121,11 @@ Contains complete transaction environment and state:
         "storage": {
           "0xkey...": "0xvalue..."
         }
+      },
+      "0xcoffee...": {
+        "balance": "0x...",
+        "nonce": "0x...",
+        ...
       }
     }
   }
@@ -171,33 +172,45 @@ Compare generated traces with reference traces:
 
 ```bash
 python compare_traces.py <reference_trace> <generated_trace>
+```
+#### Example extract and run validation against geth's evm statetest
 
-# Example
-python compare_traces.py gethTrace.log result/0xabc.../txTraceEIP3155.json
+```bash
+# let's try a sample uniswap's swap from vitalik.eth
+# add --endpoint <your rpc url> if it's not localhost
+python main.py --tx 0x88244bc267fb3fafd5333bb4f707d0905c0893026534332b7ea269849531991b 
+
+# check result files 
+ls result/0x88244bc267fb3fafd5333bb4f707d0905c0893026534332b7ea269849531991b/
+
+# run goethereum evm statetest, change to your own evm executable path
+../go-ethereum-1.14.13/evm --json statetest result/0x88244bc267fb3fafd5333bb4f707d0905c0893026534332b7ea269849531991b/txTest.json 2&> geth.log
+
+# compare log trace between geth and reference result/0x88244bc267fb3fafd5333bb4f707d0905c0893026534332b7ea269849531991b/txTraceEIP3155.json
+python compare_traces.py result/0x88244bc267fb3fafd5333bb4f707d0905c0893026534332b7ea269849531991b/txTraceEIP3155.json geth.log --no-gas
+
+# Output : 
+# Loading traces...
+#  File 1: result/0x88244bc267fb3fafd5333bb4f707d0905c0893026534332b7ea269849531991b/txTraceEIP3155.json
+#  File 2: geth.log
+#  Mode: Skipping gas comparison (checking PC, opcode, stack only)
+
+# Trace lengths:
+#  File 1: 8935 steps
+#  File 2: 8935 steps (11 non-trace lines skipped)
+
+# Comparing traces...
+#✅ SUCCESS: All 8935 trace steps match perfectly!
+#   (Note: 1 steps had gas mismatches, but were ignored)
+
 ```
 
-### Project Structure
+### Limitations 
 
-```
-CuEVM-data-collection/
-├── collectors/          # Data collection modules
-│   ├── batch.py        # Batch and block processing
-│   ├── envinfo.py      # Environment information collector
-│   ├── transaction.py  # Transaction data collector
-│   └── txstats.py      # Statistics collector
-├── utils/              # Utility functions
-│   ├── opcodes.py      # EVM opcode reference
-│   ├── eip3155_simple.py  # EIP-3155 trace converter
-│   ├── compare_traces.py  # Trace comparison tool
-│   ├── collect_env.py     # Environment collection helpers
-│   ├── collect_pre.py     # Pre-state collection helpers
-│   ├── collect_transaction.py  # Transaction helpers
-│   └── tools.py           # Common utilities
-├── main.py             # CLI entry point
-├── compare_traces.py   # Trace comparison CLI
-├── requirements.txt    # Python dependencies
-└── setup.py           # Package setup
-```
+The below are known limitations of the tool:
+  * Not support access list
+  * Gas trace difference has 1-2 corner cases from `cast -t` where the gas of the immediate instruction after returning from call has wrong value. Use `--no-gas` in `compare_trace.py` to ignore those small differences
+  * Post state root is not calculated, a dummy value is used instead. `statetest` will not result in a success match but we can check line by line in the trace to make sure the state is can replay correctly.
 
 
 ### Acknowledgements and contributors

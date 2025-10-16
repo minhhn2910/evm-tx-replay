@@ -8,7 +8,6 @@ import os
 import time
 from utils.tools import is_tx
 from utils.collect_env import cast_block_run
-from utils.plot_block_stats import generate_statistics
 from .transaction import collect_transaction_data
 
 
@@ -150,12 +149,5 @@ def collect_from_block(
     print(f"  Total time: {total_time:.2f} seconds")
     print(f"  Average time per transaction: {avg_time_per_tx:.2f} seconds")
     print(f"  Successful: {successful}/{total_transactions}")
-
-    # Generate block statistics
-    try:
-        generate_statistics([block_number], output_folder)
-        print("  Statistics generated successfully")
-    except Exception as e:
-        print(f"  Warning: Failed to generate statistics: {e}")
 
     return stats
