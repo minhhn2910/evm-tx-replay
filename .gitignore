@@ -1,0 +1,44 @@
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Python
+.venv*/
+venv*/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Testing
+.coverage*
+htmlcov/
+.tox/
+.pytest_cache/
+
+# Documentation
+docs/_build/
+
+# Results and outputs
+result/
+block_result/
+envInfoResult/
+statsResult/
+examples.txt
+
+# Temporary files
+*.log
+*.tmp
