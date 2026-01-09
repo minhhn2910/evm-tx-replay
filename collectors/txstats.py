@@ -64,6 +64,20 @@ def process_call(call_trace):
     return data_length, return_length
 
 
+def extract_call_info(call_trace):
+    """Extract call trace information including data in bytes."""
+    return {
+        "depth": call_trace.get("depth"),
+        "kind": call_trace.get("kind"),
+        "caller": call_trace.get("caller"),
+        "address": call_trace.get("address"),
+        "value": call_trace.get("value"),
+        "data": call_trace.get("data"),
+        "output": call_trace.get("output"),
+        "success": call_trace.get("success"),
+    }
+
+
 def collect_storage_accessed(trace_list):
     """Collect storage slots accessed during execution."""
     _, storage_dict, second_dict = collect_from_steps(trace_list)
@@ -97,6 +111,7 @@ def collect_lists(result_list):
     depth_list = []
     call_data_length = []
     call_return_length = []
+    call_traces = []
 
     # Add results to each list
     for t in trace_list:
@@ -111,6 +126,9 @@ def collect_lists(result_list):
         data_length, return_length = process_call(t)
         call_data_length.append(data_length)
         call_return_length.append(return_length)
+
+        # Collect call trace information
+        call_traces.append(extract_call_info(t))
 
     # Get storage from the trace
     storage_accessed = collect_storage_accessed(result_list)
@@ -140,6 +158,7 @@ def collect_lists(result_list):
         "storage_accessed": storage_accessed,
         "storage_accessed_count": storage_accessed_count,
         "storage_accessed_statistics": storage_accessed_statistics,
+        "call_traces": call_traces,
     }
 
 
