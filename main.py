@@ -11,6 +11,8 @@ import argparse
 from collectors import collect_transaction_data, collect_multiple_transactions, collect_from_file, collect_from_block
 from collectors.envinfo import save_envinfo
 from collectors.txstats import save_statistics
+from collectors.fast import collect_fast_transaction, collect_fast_block
+from utils.rpc import normalize_endpoint
 
 
 def setup_parser():
@@ -40,6 +42,15 @@ Examples:
   
   # Only statistics
   python main.py --stats 0x33f782f...
+
+  # Over an IPC socket instead of HTTP
+  python main.py --endpoint /tmp/reth.ipc --block 18000000
+
+  # Fast mode: call tree and state diff only, no EIP-3155 trace
+  python main.py --fast --block 18000000
+
+  # Collect a block with 8 transactions in flight at a time
+  python main.py --jobs 8 --block 18000000
         """,
     )
 
@@ -47,12 +58,20 @@ Examples:
     parser.add_argument(
         "--endpoint",
         default="http://localhost:8545",
-        help="RPC endpoint URL (default: localhost:8545, auto-adds http:// if missing)",
+        help="RPC endpoint: URL, host:port, or IPC socket path (default: localhost:8545)",
     )
     parser.add_argument("-o", "--output", help="Output folder (default varies by command)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing results")
     parser.add_argument(
         "--max-attempts", type=int, default=3, help="Maximum retry attempts for batch/block operations (default: 3)"
+    )
+    parser.add_argument(
+        "-j", "--jobs", type=int, default=1, help="Transactions to collect concurrently (default: 1)"
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Collect only the call tree and state diff via debug_trace*, skipping the EIP-3155 trace",
     )
 
     # Command options (mutually exclusive)
@@ -72,13 +91,6 @@ Examples:
     return parser
 
 
-def normalize_endpoint(endpoint):
-    """Normalize RPC endpoint by adding http:// if missing."""
-    if endpoint and not endpoint.startswith(("http://", "https://", "ws://", "wss://")):
-        return f"http://{endpoint}"
-    return endpoint
-
-
 def main():
     """Main entry point for the CLI."""
     parser = setup_parser()
@@ -94,14 +106,13 @@ def main():
             if "," in args.tx:
                 # Multiple transactions
                 count = collect_multiple_transactions(
-                    args.tx, output_folder=output, overwrite=args.overwrite, endpoint=args.endpoint
+                    args.tx, output_folder=output, overwrite=args.overwrite, endpoint=args.endpoint, fast=args.fast
                 )
                 print(f"\nSuccessfully collected {count} transaction(s)")
             else:
                 # Single transaction
-                collect_transaction_data(
-                    args.tx, output_folder=output, overwrite=args.overwrite, endpoint=args.endpoint
-                )
+                collect = collect_fast_transaction if args.fast else collect_transaction_data
+                collect(args.tx, output_folder=output, overwrite=args.overwrite, endpoint=args.endpoint)
                 print(f"\nSuccessfully collected transaction {args.tx}")
 
         # Handle file/batch collection
@@ -112,19 +123,28 @@ def main():
                 overwrite=args.overwrite,
                 max_attempts=args.max_attempts,
                 endpoint=args.endpoint,
+                jobs=args.jobs,
+                fast=args.fast,
             )
             print(f'\nBatch collection completed: {stats["successful"]}/{stats["total_transactions"]} successful')
 
         # Handle block collection
         elif args.block:
             output = args.output or "block_result"
-            stats = collect_from_block(
-                args.block,
-                output_folder=output,
-                overwrite=args.overwrite,
-                max_attempts=args.max_attempts,
-                endpoint=args.endpoint,
-            )
+            if args.fast:
+                # One pair of debug_traceBlockByNumber calls covers the whole block
+                stats = collect_fast_block(
+                    args.block, output_folder=output, overwrite=args.overwrite, endpoint=args.endpoint
+                )
+            else:
+                stats = collect_from_block(
+                    args.block,
+                    output_folder=output,
+                    overwrite=args.overwrite,
+                    max_attempts=args.max_attempts,
+                    endpoint=args.endpoint,
+                    jobs=args.jobs,
+                )
             print(f'\nBlock collection completed: {stats["successful"]}/{stats["total_transactions"]} successful')
 
         # Handle environment info only

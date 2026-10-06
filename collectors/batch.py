@@ -1,17 +1,79 @@
 """
 Batch collectors for processing multiple transactions.
 
-Supports collecting from text files and entire blocks.
+Supports collecting from text files and entire blocks, optionally in parallel.
 """
 
 import os
+import shutil
 import time
-from utils.tools import is_tx
+from concurrent.futures import ThreadPoolExecutor
+from utils.tools import is_tx, report_timing
 from utils.collect_env import cast_block_run
 from .transaction import collect_transaction_data
+from .fast import collect_fast_transaction
 
 
-def collect_from_file(file_name, output_folder=None, overwrite=False, max_attempts=3, endpoint="http://localhost:8545"):
+def make_collector(output_folder, endpoint, fast=False):
+    """Return a one-argument collector that writes into output_folder."""
+    collect = collect_fast_transaction if fast else collect_transaction_data
+    return lambda tx: collect(tx, output_folder, overwrite=False, endpoint=endpoint)
+
+
+def collect_with_retry(tx, collect, max_attempts):
+    """Collect a single transaction, retrying on failure."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            collect(tx)
+            print(f"Success: collected transaction {tx}")
+            return True
+        except Exception as e:
+            print(f"Failure: attempt {attempt} failed for transaction {tx}: {e}")
+            if attempt < max_attempts:
+                time.sleep(2)
+
+    print(f"Failure: skipping transaction {tx} after {max_attempts} failed attempts")
+    return False
+
+
+def run_batch(tx_list, collect, label, max_attempts=3, jobs=1):
+    """
+    Collect every transaction in tx_list, in parallel when jobs > 1.
+
+    Args:
+        tx_list: Transaction hashes to collect
+        collect: One-argument collector, as built by make_collector
+        label: Name used in the summary output
+        max_attempts: Maximum retry attempts per transaction
+        jobs: Number of transactions to collect concurrently
+
+    Returns:
+        Dictionary with timing statistics
+    """
+    start_time = time.time()
+    print(f"Processing {len(tx_list)} transactions with {jobs} job(s)")
+
+    def collect_one(tx):
+        return collect_with_retry(tx, collect, max_attempts)
+
+    if jobs > 1:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            results = list(pool.map(collect_one, tx_list))
+    else:
+        results = [collect_one(tx) for tx in tx_list]
+
+    return report_timing(start_time, len(tx_list), sum(results), label)
+
+
+def collect_from_file(
+    file_name,
+    output_folder=None,
+    overwrite=False,
+    max_attempts=3,
+    endpoint="http://localhost:8545",
+    jobs=1,
+    fast=False,
+):
     """
     Collect data for all transactions listed in a text file.
 
@@ -21,6 +83,8 @@ def collect_from_file(file_name, output_folder=None, overwrite=False, max_attemp
         overwrite: Whether to overwrite existing results
         max_attempts: Maximum retry attempts per transaction
         endpoint: RPC endpoint URL
+        jobs: Number of transactions to collect concurrently
+        fast: Collect call tree and state diff instead of an EIP-3155 trace
 
     Returns:
         Dictionary with timing statistics
@@ -31,52 +95,15 @@ def collect_from_file(file_name, output_folder=None, overwrite=False, max_attemp
 
     if overwrite and os.path.exists(output_folder):
         print(f"Deleting existing folder to overwrite {output_folder}")
-        os.system(f"rm -rf {output_folder}")
+        shutil.rmtree(output_folder)
 
     # Read transaction hashes from file
     with open(file_name, "r", encoding="utf-8") as file:
-        tx_list = [line.strip() for line in file.readlines() if is_tx(line.strip())]
+        tx_list = [line.strip() for line in file if is_tx(line.strip())]
 
-    start_time = time.time()
-    total_transactions = len(tx_list)
-    successful = 0
+    collect = make_collector(output_folder, endpoint, fast)
 
-    print(f"Processing {total_transactions} transactions from {file_name}")
-
-    for tx in tx_list:
-        attempts = 0
-        while attempts < max_attempts:
-            try:
-                collect_transaction_data(tx, output_folder, overwrite=False, endpoint=endpoint)
-                print(f"Success: collected transaction {tx}")
-                successful += 1
-                break
-            except Exception as e:
-                attempts += 1
-                print(f"Failure: attempt {attempts} failed for transaction {tx}: {e}")
-                if attempts < max_attempts:
-                    time.sleep(2)
-                else:
-                    print(f"Failure: skipping transaction {tx} after {max_attempts} failed attempts")
-
-    end_time = time.time()
-    total_time = end_time - start_time
-    avg_time_per_tx = total_time / total_transactions if total_transactions > 0 else 0
-
-    stats = {
-        "total_time": total_time,
-        "avg_time_per_tx": avg_time_per_tx,
-        "total_transactions": total_transactions,
-        "successful": successful,
-        "failed": total_transactions - successful,
-    }
-
-    print("\nCollection complete:")
-    print(f"  Total time: {total_time:.2f} seconds")
-    print(f"  Average time per transaction: {avg_time_per_tx:.2f} seconds")
-    print(f"  Successful: {successful}/{total_transactions}")
-
-    return stats
+    return run_batch(tx_list, collect, f"Collection from {file_name}", max_attempts, jobs)
 
 
 def collect_from_block(
@@ -85,6 +112,8 @@ def collect_from_block(
     overwrite=False,
     max_attempts=3,
     endpoint="http://localhost:8545",
+    jobs=1,
+    fast=False,
 ):
     """
     Collect data for all transactions from a specific block.
@@ -95,13 +124,14 @@ def collect_from_block(
         overwrite: Whether to overwrite existing results
         max_attempts: Maximum retry attempts per transaction
         endpoint: RPC endpoint URL
+        jobs: Number of transactions to collect concurrently
+        fast: Collect call tree and state diff instead of an EIP-3155 trace
 
     Returns:
         Dictionary with timing statistics
     """
     # Get all transactions from the block
-    block_data = cast_block_run(block_number, endpoint)
-    block_tx_list = block_data.get("transactions", [])
+    block_tx_list = cast_block_run(block_number, endpoint).get("transactions", [])
 
     os.makedirs(output_folder, exist_ok=True)
     block_folder_prefix = f"{output_folder}/{block_number}"
@@ -109,45 +139,8 @@ def collect_from_block(
     # Create result directory if it doesn't exist
     if overwrite and os.path.exists(block_folder_prefix):
         print(f"Deleting existing block folder to overwrite {block_number}")
-        os.system(f"rm -rf {block_folder_prefix}")
+        shutil.rmtree(block_folder_prefix)
 
-    start_time = time.time()
-    total_transactions = len(block_tx_list)
-    successful = 0
+    collect = make_collector(block_folder_prefix, endpoint, fast)
 
-    print(f"Processing {total_transactions} transactions from block {block_number}")
-
-    for tx in block_tx_list:
-        attempts = 0
-        while attempts < max_attempts:
-            try:
-                collect_transaction_data(tx, block_folder_prefix, overwrite=False, endpoint=endpoint)
-                print(f"Success: collected transaction {tx} from block {block_number}")
-                successful += 1
-                break
-            except Exception as e:
-                attempts += 1
-                print(f"Failure: attempt {attempts} failed for transaction {tx}: {e}")
-                if attempts < max_attempts:
-                    time.sleep(2)
-                else:
-                    print(f"Failure: skipping transaction {tx} after {max_attempts} failed attempts")
-
-    end_time = time.time()
-    total_time = end_time - start_time
-    avg_time_per_tx = total_time / total_transactions if total_transactions > 0 else 0
-
-    stats = {
-        "total_time": total_time,
-        "avg_time_per_tx": avg_time_per_tx,
-        "total_transactions": total_transactions,
-        "successful": successful,
-        "failed": total_transactions - successful,
-    }
-
-    print("\nBlock collection complete:")
-    print(f"  Total time: {total_time:.2f} seconds")
-    print(f"  Average time per transaction: {avg_time_per_tx:.2f} seconds")
-    print(f"  Successful: {successful}/{total_transactions}")
-
-    return stats
+    return run_batch(block_tx_list, collect, f"Block {block_number} collection", max_attempts, jobs)

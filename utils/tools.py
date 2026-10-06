@@ -1,8 +1,11 @@
 import json
 import statistics
 import subprocess
+import time
 from collections import Counter
+from collections.abc import Mapping
 from hexbytes import HexBytes
+from utils.rpc import cast_bin
 
 
 def is_tx(tx_line: str):
@@ -27,8 +30,8 @@ def strict_extend(list1, list2):
     # extend list1 with list2
     list1.extend(list2)
 
-    # remove duplicates by converting to a set and back to a list
-    list1 = list(set(list1))
+    # remove duplicates, sorted so repeated runs produce identical output
+    list1 = sorted(set(list1), key=str)
 
     return list1
 
@@ -59,14 +62,35 @@ def json_dumps_with_hexbytes(obj, **kwargs):
 
 
 def convert_hexbytes_to_str(obj):
-    """Recursively convert HexBytes objects to hex strings."""
+    """Recursively convert HexBytes and mapping objects to JSON-safe values."""
     if isinstance(obj, HexBytes):
         return obj.hex()
-    elif isinstance(obj, dict):
+    if isinstance(obj, bytes):
+        return "0x" + obj.hex()
+    if isinstance(obj, Mapping):
         return {k: convert_hexbytes_to_str(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return type(obj)(convert_hexbytes_to_str(item) for item in obj)
+    if isinstance(obj, (list, tuple)):
+        return [convert_hexbytes_to_str(item) for item in obj]
     return obj
+
+
+def report_timing(start_time, total_transactions, successful, label):
+    """Print and return the timing statistics shared by the collection commands."""
+    total_time = time.time() - start_time
+    avg_time_per_tx = total_time / total_transactions if total_transactions > 0 else 0
+
+    print(f"\n{label} complete:")
+    print(f"  Total time: {total_time:.2f} seconds")
+    print(f"  Average time per transaction: {avg_time_per_tx:.2f} seconds")
+    print(f"  Successful: {successful}/{total_transactions}")
+
+    return {
+        "total_time": total_time,
+        "avg_time_per_tx": avg_time_per_tx,
+        "total_transactions": total_transactions,
+        "successful": successful,
+        "failed": total_transactions - successful,
+    }
 
 
 def count_and_sort(lst):
@@ -134,90 +158,40 @@ def get_statistics(numbers):
 
 
 # use foundry collect trace
-def cast_trace_run(transaction_hash, rpc_url):
+def cast_run(transaction_hash, rpc_url, trace_printer=False):
     """
-    Run cast command and extract arena JSON for statistics.
+    Run cast command and extract the trace steps and arena JSON.
+
+    `--json` prints the arena as the last line of stdout; with `-t` the ordered
+    opcode trace lines precede it.
 
     Args:
         transaction_hash: Transaction hash
-        rpc_url: RPC endpoint URL
+        rpc_url: RPC endpoint URL (HTTP, WS or IPC socket path)
+        trace_printer: Whether to also collect ordered opcode steps (cast -t)
 
     Returns:
-        Arena data (list of trace nodes)
+        Tuple of (trace_lines, arena)
     """
-    command = [
-        "cast",
-        "run",
-        transaction_hash,
-        "-r",
-        rpc_url,
-        "--decode-internal",
-        "-vvvvv",
-        "--json",
-        "--no-rate-limit",
-    ]
+    command = [cast_bin, "run", transaction_hash, "-r", rpc_url, "-vvvvv", "--json", "--no-rate-limit"]
+    if trace_printer:
+        command.append("-t")
 
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
-    lines = result.stdout.strip().split("\n")
-    traces_index = -1
+    stdout = subprocess.run(command, capture_output=True, text=True, check=True).stdout
 
-    for index, line in enumerate(lines):
-        if "Traces:" in line:
-            traces_index = index
-            break
-    output_lines = lines[traces_index + 1 :]
+    # The arena is the final line, so everything before it is the opcode trace
+    json_start = stdout.rstrip().rfind("\n") + 1
+    arena = json.loads(stdout[json_start:]).get("arena", [])
+    trace_lines = stdout[:json_start].splitlines() if trace_printer else []
 
-    filtered_output = "\n".join(output_lines)
-    json_output = json.loads(filtered_output)
+    return trace_lines, arena
 
-    return json_output["arena"]
+
+def cast_trace_run(transaction_hash, rpc_url):
+    """Return only the arena (list of trace nodes) for statistics."""
+    return cast_run(transaction_hash, rpc_url)[1]
 
 
 def cast_trace_run_with_steps(transaction_hash, rpc_url):
-    """
-    Run cast command with -t flag to get ordered trace steps and arena JSON.
-
-    Args:
-        transaction_hash: Transaction hash
-        rpc_url: RPC endpoint URL
-
-    Returns:
-        Tuple of (trace_lines, arena) where trace_lines are the ordered step traces
-        and arena is the JSON data for statistics
-    """
-    command = [
-        "cast",
-        "run",
-        transaction_hash,
-        "-r",
-        rpc_url,
-        "--decode-internal",
-        "-vvvvv",
-        "--json",
-        "--no-rate-limit",
-        "-t",
-    ]
-
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
-    lines = result.stdout.strip().split("\n")
-
-    # Find the last line that starts with "depth:" - this is the last trace line
-    last_trace_index = -1
-    for index, line in enumerate(lines):
-        if line.strip().startswith("depth:"):
-            last_trace_index = index
-
-    # Split into trace lines and JSON
-    trace_lines = []
-    if last_trace_index >= 0:
-        trace_lines = lines[: last_trace_index + 1]
-        json_lines = lines[last_trace_index + 1 :]
-    else:
-        # No trace lines found, everything is JSON
-        json_lines = lines
-
-    # Parse JSON from remaining lines
-    json_str = "\n".join(json_lines)
-    json_output = json.loads(json_str)
-
-    return trace_lines, json_output.get("arena", [])
+    """Return (trace_lines, arena) with ordered opcode steps for EIP-3155."""
+    return cast_run(transaction_hash, rpc_url, trace_printer=True)

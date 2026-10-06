@@ -1,7 +1,7 @@
 # Function to collect transaction traces and save them as JSON files
-import subprocess
 from web3 import Web3
-from utils.tools import make_hex_even, remove_extra_zeros, cast_trace_run, add_to_dict, strict_extend, extend_dict
+from utils.tools import make_hex_even, cast_trace_run, add_to_dict, strict_extend, extend_dict
+from utils.rpc import get_w3
 
 
 # detect whether a string is an address
@@ -99,48 +99,36 @@ def collect_from_steps(json_output):
     return address_list, storage_dict, second_dict
 
 
-# retrieve balance from certain block
-def retrieve_balance(w3, contract_address, block_number):
-    try:
-        balance = w3.eth.get_balance(contract_address, block_identifier=block_number)
-        return make_hex_even(hex(balance))
-    # if no response, set balance as 0
-    except Exception as e:
-        print("balance retrival error:", e)
-        return "0x00"
+# retrieve balance, nonce and code for every address in a single batched request
+def retrieve_accounts(w3, address_list, block_number):
+    with w3.batch_requests() as batch:
+        for address in address_list:
+            checksum_address = Web3.to_checksum_address(address)
+            batch.add(w3.eth.get_balance(checksum_address, block_identifier=block_number))
+            batch.add(w3.eth.get_transaction_count(checksum_address, block_identifier=block_number))
+            batch.add(w3.eth.get_code(checksum_address, block_identifier=block_number))
+        results = batch.execute()
 
-
-# retrieve nonce from certain block
-def retrieve_nonce(w3, contract_address, block_number):
-    try:
-        nonce = w3.eth.get_transaction_count(contract_address, block_identifier=block_number)
-        return make_hex_even(hex(nonce))
-    # if no response, set nonce as 1
-    except Exception as e:
-        print("nonce retrival error:", e)
-        return "0x01"
-
-
-# retrieve code from certain block
-def retrieve_code(w3, contract_address, block_number):
-    try:
-        bytecode = w3.eth.get_code(contract_address, block_identifier=block_number)
-        return "0x" + bytecode.hex()
-    # if no response, set code as empty
-    except Exception as e:
-        print("code retrival error:", e)
-        return "0x"
+    # results keep the order the calls were added, three per address
+    return {
+        address: {
+            "balance": make_hex_even(hex(results[i])),
+            "nonce": make_hex_even(hex(results[i + 1])),
+            "code": "0x" + results[i + 2].hex(),
+        }
+        for i, address in zip(range(0, len(results), 3), address_list)
+    }
 
 
 # collect all the pre-transaction information
-def collect_pre(transaction_hash, block_number, rpc_url):
-    # collect trace and get addresses and storages in the trace
-    trace_list = cast_trace_run(transaction_hash, rpc_url)
+def collect_pre(transaction_hash, block_number, rpc_url, trace_list=None):
+    # reuse an already collected trace when available, otherwise run cast
+    if trace_list is None:
+        trace_list = cast_trace_run(transaction_hash, rpc_url)
     address_list, storage_dict, second_dict = collect_from_steps(trace_list)
 
-    # set the previous block and w3
-    previous_block = block_number - 1
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    # read every account's state from the previous block
+    accounts = retrieve_accounts(get_w3(rpc_url), address_list, block_number - 1)
 
     pre_dict = {}
 
@@ -150,12 +138,6 @@ def collect_pre(transaction_hash, block_number, rpc_url):
             storage = storage_dict[address]
         else:
             storage = {}
-
-        # get address related information
-        checksum_address = Web3.to_checksum_address(address)
-        balance = retrieve_balance(w3, checksum_address, previous_block)
-        nonce = retrieve_nonce(w3, checksum_address, previous_block)
-        code = retrieve_code(w3, checksum_address, previous_block)
 
         # add new storage in second dict to storage dict
         if address in second_dict:
@@ -170,6 +152,6 @@ def collect_pre(transaction_hash, block_number, rpc_url):
         storage = {k: v for k, v in storage.items() if v != "0x00"}
 
         # add information to pre-transaction dict
-        pre_dict[address] = {"balance": balance, "nonce": nonce, "code": code, "storage": storage}
+        pre_dict[address] = {**accounts[address], "storage": storage}
 
     return pre_dict

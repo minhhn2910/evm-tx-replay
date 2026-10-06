@@ -36,12 +36,12 @@ def collect_transaction_data(
 
     os.makedirs(tx_folder_prefix, exist_ok=True)
 
-    # Collect environment info
-    env_info = collect_envinfo(transaction_hash, endpoint)
-
     # Collect trace data with ordered steps and arena
     print(f"Collecting trace data for {transaction_hash}")
     trace_lines, arena = cast_trace_run_with_steps(transaction_hash, endpoint)
+
+    # Collect environment info, reusing the arena instead of running cast again
+    env_info = collect_envinfo(transaction_hash, endpoint, arena=arena)
 
     # Generate statistics from arena
     from .txstats import collect_lists
@@ -72,7 +72,9 @@ def collect_transaction_data(
     return True
 
 
-def collect_multiple_transactions(tx_hashes, output_folder="result", overwrite=False, endpoint="http://localhost:8545"):
+def collect_multiple_transactions(
+    tx_hashes, output_folder="result", overwrite=False, endpoint="http://localhost:8545", fast=False
+):
     """
     Collect data for multiple transactions.
 
@@ -81,10 +83,15 @@ def collect_multiple_transactions(tx_hashes, output_folder="result", overwrite=F
         output_folder: Base folder for output files
         overwrite: Whether to overwrite existing results
         endpoint: RPC endpoint URL
+        fast: Collect call tree and state diff instead of an EIP-3155 trace
 
     Returns:
         Number of successfully processed transactions
     """
+    from .fast import collect_fast_transaction
+
+    collect = collect_fast_transaction if fast else collect_transaction_data
+
     # Handle comma-separated string
     if isinstance(tx_hashes, str):
         if "," in tx_hashes:
@@ -101,7 +108,7 @@ def collect_multiple_transactions(tx_hashes, output_folder="result", overwrite=F
     for tx_hash in valid_hashes:
         try:
             print(f"Collecting data for {tx_hash}")
-            collect_transaction_data(tx_hash, output_folder, overwrite, endpoint)
+            collect(tx_hash, output_folder, overwrite, endpoint)
             success_count += 1
         except Exception as e:
             print(f"Error collecting data for {tx_hash}: {e}")

@@ -1,13 +1,11 @@
-from web3 import Web3
 from utils.tools import make_hex_even
+from utils.rpc import get_w3
 
 
 def collect_transaction(transaction_hash, rpc):
     try:
-        # initialize Web3 instance with the RPC provider
-        w3 = Web3(Web3.HTTPProvider(rpc))
         # get transaction details
-        basic_transaction = w3.eth.get_transaction(transaction_hash)
+        basic_transaction = get_w3(rpc).eth.get_transaction(transaction_hash)
 
     except Exception as e:
         # handle other unexpected exceptions

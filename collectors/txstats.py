@@ -46,7 +46,7 @@ def collect_steps(steps):
         memory_size_list.append((len(step["memory"]) - 2) / 2)
         accessed_addresses.add(step.get("contract"))
 
-    accessed_addresses = list(accessed_addresses)
+    accessed_addresses = sorted(accessed_addresses, key=str)
 
     return {
         "opcodes": opcode_list,
@@ -134,7 +134,7 @@ def collect_lists(result_list):
     storage_accessed = collect_storage_accessed(result_list)
 
     # Get statistics from all lists
-    address_list = list(set(address_list))
+    address_list = sorted(set(address_list), key=str)
     opcode_count = count_and_sort(full_opcode_list)
     opcode_name_count = process_reference(opcode_count)
     stack_size_statistics = get_statistics(full_stack_size_list)
