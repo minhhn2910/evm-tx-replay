@@ -60,8 +60,8 @@ def collect_steps(steps, trace=None):
 
 def process_call(call_trace):
     """Get information from each call."""
-    data_length = len(call_trace["data"])
-    return_length = len(call_trace["output"])
+    data_length = len(call_trace.get("data") or "")
+    return_length = len(call_trace.get("output") or "")
     return data_length, return_length
 
 

@@ -97,10 +97,16 @@ def collect_address(trace_address_dict):
 # collect all keys and corresponded values in the storage change list
 def get_all_keys(storage_list):
     key_dict = {}
-    for storage_change in storage_list:
-        # make sure that hex is even
-        if make_hex_even(storage_change["key"]) not in key_dict:
-            key_dict[make_hex_even(storage_change["key"])] = make_hex_even(storage_change["had_value"])
+    for storage_change in storage_list or []:
+        if not isinstance(storage_change, dict):
+            continue
+        key = storage_change.get("key")
+        had_value = storage_change.get("had_value")
+        if key is None:
+            continue
+        even_key = make_hex_even(key)
+        if even_key not in key_dict:
+            key_dict[even_key] = make_hex_even(had_value)
     return key_dict
 
 
@@ -123,14 +129,17 @@ def collect_from_steps(json_output):
     trace_storage_dict = {}
     # get unrecorded storage changes from trace
     second_dict = {}
-    for element in json_output:
-        # collect trace and related information and store individually
-        new_trace = element["trace"]
+    for element in json_output or []:
+        if not isinstance(element, dict):
+            continue
+        new_trace = element.get("trace") or {}
         address_list, storage_change_dict, second_storage_dict = collect_state_changes(
             new_trace.get("steps") or [], contract=new_trace.get("address")
         )
-        address_list = strict_extend(address_list, [new_trace["caller"].lower(), new_trace["address"].lower()])
-        idx = element["idx"]
+        caller = (new_trace.get("caller") or "0x").lower()
+        address = (new_trace.get("address") or "0x").lower()
+        address_list = strict_extend(address_list, [caller, address])
+        idx = element.get("idx", 0)
         trace_address_dict[idx] = address_list
         trace_storage_dict[idx] = storage_change_dict
         for key in second_storage_dict:

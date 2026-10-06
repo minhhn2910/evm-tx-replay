@@ -98,17 +98,18 @@ def count_and_sort(lst):
 
 
 def make_hex_even(value):
-    # Convert the value to hex and remove the '0x' prefix
+    if value is None:
+        return "0x00"
     if isinstance(value, int):
         hex_value = hex(value)[2:]
     else:
-        hex_value = value[2:]
+        hex_value = str(value)
+        if hex_value.startswith(("0x", "0X")):
+            hex_value = hex_value[2:]
 
-    # If the length of the hex value is odd, add a leading '0'
     if len(hex_value) % 2 != 0:
         hex_value = "0" + hex_value
 
-    # Return the hex value with '0x' prefix
     return "0x" + hex_value
 
 
@@ -190,7 +191,12 @@ def cast_run(transaction_hash, rpc_url, trace_printer=False):
 
     json_start = stdout.rstrip().rfind("\n") + 1
     payload = unwrap_cast_json(stdout[json_start:] or stdout)
-    arena = payload.get("arena", []) if isinstance(payload, dict) else payload or []
+    if isinstance(payload, list):
+        arena = payload
+    elif isinstance(payload, dict):
+        arena = payload.get("arena") or payload.get("traces") or []
+    else:
+        arena = []
     trace_lines = stdout[:json_start].splitlines() if trace_printer else []
 
     return trace_lines, arena

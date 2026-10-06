@@ -16,12 +16,13 @@ def collect_transaction(transaction_hash, rpc):
         block_num = int(block_num, 16)
 
     to = tx.get("to")
+    sender = tx.get("from") or "0x"
     transaction_data = {
-        "data": [tx.get("input")],
+        "data": [tx.get("input") or "0x"],
         "gasLimit": [make_hex_even(tx.get("gas"))],
-        "gasPrice": make_hex_even(tx.get("gasPrice")),
+        "gasPrice": make_hex_even(tx.get("gasPrice") or tx.get("maxFeePerGas")),
         "nonce": make_hex_even(tx.get("nonce")),
-        "sender": tx.get("from").lower(),
+        "sender": sender.lower(),
         "to": to.lower() if to else "0x",
         "value": [make_hex_even(tx.get("value"))],
     }
