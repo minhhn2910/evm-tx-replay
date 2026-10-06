@@ -4,7 +4,7 @@ import time
 from collections import Counter
 from collections.abc import Mapping
 from hexbytes import HexBytes
-from utils.rpc import run_cast
+from utils.rpc import run_cast, unwrap_cast_json
 
 
 def is_tx(tx_line: str):
@@ -162,7 +162,8 @@ def cast_run(transaction_hash, rpc_url, trace_printer=False):
     Run cast command and extract the trace steps and arena JSON.
 
     `--json` prints the arena as the last line of stdout; with `-t` the ordered
-    opcode trace lines precede it.
+    opcode trace lines precede it. OpenChain/Sourcify lookups are disabled so
+    air-gapped or CA-less docker images do not fail after a successful replay.
 
     Args:
         transaction_hash: Transaction hash
@@ -181,14 +182,15 @@ def cast_run(transaction_hash, rpc_url, trace_printer=False):
         "--json",
         "--no-rate-limit",
         "--prestate-tracer",
+        "--disable-external-identification",
     ]
     if trace_printer:
         args.append("-t")
     stdout = run_cast(*args)
 
-    # The arena is the final line, so everything before it is the opcode trace
     json_start = stdout.rstrip().rfind("\n") + 1
-    arena = json.loads(stdout[json_start:]).get("arena", [])
+    payload = unwrap_cast_json(stdout[json_start:] or stdout)
+    arena = payload.get("arena", []) if isinstance(payload, dict) else payload or []
     trace_lines = stdout[:json_start].splitlines() if trace_printer else []
 
     return trace_lines, arena

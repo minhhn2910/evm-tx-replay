@@ -26,19 +26,15 @@ def collect_transaction_data(
     Returns:
         True if successful
     """
+    print(f"Collecting trace data for {transaction_hash}")
+    trace_lines, arena = cast_trace_run_with_steps(transaction_hash, endpoint)
+
     os.makedirs(output_folder, exist_ok=True)
     tx_folder_prefix = f"{output_folder}/{transaction_hash}"
-
-    # Create result directory if it doesn't exist
     if overwrite and os.path.exists(tx_folder_prefix):
         print(f"Deleting existing folder to overwrite {transaction_hash}")
         os.system(f"rm -rf {tx_folder_prefix}")
-
     os.makedirs(tx_folder_prefix, exist_ok=True)
-
-    # Collect trace data with ordered steps and arena
-    print(f"Collecting trace data for {transaction_hash}")
-    trace_lines, arena = cast_trace_run_with_steps(transaction_hash, endpoint)
 
     # Collect environment info, reusing the arena instead of running cast again
     env_info = collect_envinfo(transaction_hash, endpoint, arena=arena)
