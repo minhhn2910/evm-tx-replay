@@ -41,8 +41,29 @@ def get_w3(endpoint):
     return _w3_cache[endpoint]
 
 
-def rpc_call(endpoint, method, params):
-    return get_w3(endpoint).manager.request_blocking(method, params)
+def _web3_usable(endpoint):
+    if is_ipc(endpoint):
+        return os.path.exists(endpoint.removeprefix("file://"))
+    return True
+
+
+def _rpc_via_cast(endpoint, method, params):
+    args = ["rpc", "--rpc-url", endpoint, method, *(json.dumps(p) for p in params)]
+    return unwrap_cast_json(run_cast(*args))
+
+
+def rpc_call(endpoint, method, params=None):
+    """JSON-RPC via web3 when the endpoint is reachable, else `cast rpc`.
+
+    Docker-wrapped cast can see an IPC socket that this Python process cannot.
+    """
+    params = list(params or [])
+    if _web3_usable(endpoint):
+        try:
+            return get_w3(endpoint).manager.request_blocking(method, params)
+        except OSError:
+            pass
+    return _rpc_via_cast(endpoint, method, params)
 
 
 def unwrap_cast_json(text):

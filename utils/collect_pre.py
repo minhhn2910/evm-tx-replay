@@ -1,7 +1,7 @@
 # Function to collect transaction traces and save them as JSON files
 from web3 import Web3
 from utils.tools import make_hex_even, cast_trace_run, add_to_dict, strict_extend, extend_dict
-from utils.rpc import get_w3
+from utils.rpc import rpc_call
 
 
 # detect whether a string is an address
@@ -99,25 +99,22 @@ def collect_from_steps(json_output):
     return address_list, storage_dict, second_dict
 
 
-# retrieve balance, nonce and code for every address in a single batched request
-def retrieve_accounts(w3, address_list, block_number):
-    with w3.batch_requests() as batch:
-        for address in address_list:
-            checksum_address = Web3.to_checksum_address(address)
-            batch.add(w3.eth.get_balance(checksum_address, block_identifier=block_number))
-            batch.add(w3.eth.get_transaction_count(checksum_address, block_identifier=block_number))
-            batch.add(w3.eth.get_code(checksum_address, block_identifier=block_number))
-        results = batch.execute()
-
-    # results keep the order the calls were added, three per address
-    return {
-        address: {
-            "balance": make_hex_even(hex(results[i])),
-            "nonce": make_hex_even(hex(results[i + 1])),
-            "code": "0x" + results[i + 2].hex(),
+def retrieve_accounts(rpc_url, address_list, block_number):
+    block = hex(block_number) if isinstance(block_number, int) else block_number
+    accounts = {}
+    for address in address_list:
+        checksum = Web3.to_checksum_address(address)
+        balance = rpc_call(rpc_url, "eth_getBalance", [checksum, block])
+        nonce = rpc_call(rpc_url, "eth_getTransactionCount", [checksum, block])
+        code = rpc_call(rpc_url, "eth_getCode", [checksum, block])
+        if not isinstance(code, str):
+            code = "0x" + code.hex()
+        accounts[address] = {
+            "balance": make_hex_even(balance),
+            "nonce": make_hex_even(nonce),
+            "code": code,
         }
-        for i, address in zip(range(0, len(results), 3), address_list)
-    }
+    return accounts
 
 
 # collect all the pre-transaction information
@@ -128,7 +125,7 @@ def collect_pre(transaction_hash, block_number, rpc_url, trace_list=None):
     address_list, storage_dict, second_dict = collect_from_steps(trace_list)
 
     # read every account's state from the previous block
-    accounts = retrieve_accounts(get_w3(rpc_url), address_list, block_number - 1)
+    accounts = retrieve_accounts(rpc_url, address_list, block_number - 1)
 
     pre_dict = {}
 
