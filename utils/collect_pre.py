@@ -21,27 +21,68 @@ def find_address_in_list(stack_list):
     return address_list
 
 
+# Newer foundry dropped per-step `contract`/`depth`; they live on the parent call.
+CALL_OPS = {"F1", "F2", "F4", "FA", "CALL", "CALLCODE", "DELEGATECALL", "STATICCALL"}
+SLOAD_SSTORE = {"54", "55", "SLOAD", "SSTORE"}
+
+
+def step_address(step, fallback=None):
+    addr = step.get("contract") or step.get("address") or fallback
+    return addr.lower() if isinstance(addr, str) else addr
+
+
+def step_stack(step):
+    stack = step.get("stack")
+    if not stack:
+        return []
+    if isinstance(stack, dict):
+        stack = stack.get("data") or stack.get("values") or []
+    return list(stack)
+
+
+def step_op_key(step):
+    op = step.get("op", 0)
+    if isinstance(op, dict):
+        op = op.get("code") or op.get("name") or 0
+    if isinstance(op, str):
+        if op.startswith(("0x", "0X")):
+            return op[2:].upper()
+        if op.isdigit():
+            return hex(int(op))[2:].upper()
+        return op.upper()
+    return hex(int(op))[2:].upper()
+
+
+def step_memory_size(step):
+    mem = step.get("memory")
+    if mem is None:
+        return 0
+    if isinstance(mem, dict):
+        mem = mem.get("bytes") or mem.get("data") or ""
+    if isinstance(mem, str):
+        hex_len = len(mem) - 2 if mem.startswith("0x") else len(mem)
+        return hex_len / 2
+    return 0
+
+
 # collect all state changes in the steps of a call trace
-def collect_state_changes(steps):
+def collect_state_changes(steps, contract=None):
     address_list = []
     storage_change_dict = {}
     second_storage_dict = {}
-    step_index = 0
-    for step in steps:
-        # collect all steps' contracts
-        address_list = strict_extend(address_list, [step["contract"]])
-        op_code = hex(step["op"])[2:].upper()
-        # collect targets of call steps
-        if op_code in ["F1", "F2", "F4", "FA"]:
-            address_list = strict_extend(address_list, find_address_in_list(step["stack"]))
-        # if a step has storage change
-        if step["storage_change"]:
-            add_to_dict(storage_change_dict, step["contract"], step["storage_change"])
-
-        # if the step's opcode is "54" or "55".
-        if op_code in ["54", "55"] and step_index != len(steps) - 1:
-            add_to_dict(second_storage_dict, step["contract"], [step["stack"][-1], steps[step_index + 1]["stack"][-1]])
-        step_index += 1
+    for step_index, step in enumerate(steps):
+        addr = step_address(step, contract)
+        if addr:
+            address_list = strict_extend(address_list, [addr])
+        op_code = step_op_key(step)
+        stack = step_stack(step)
+        if op_code in CALL_OPS:
+            address_list = strict_extend(address_list, find_address_in_list(stack))
+        storage_change = step.get("storage_change")
+        if storage_change and addr:
+            add_to_dict(storage_change_dict, addr, storage_change)
+        if op_code in SLOAD_SSTORE and step_index != len(steps) - 1 and addr and stack:
+            add_to_dict(second_storage_dict, addr, [stack[-1], step_stack(steps[step_index + 1])[-1]])
     return address_list, storage_change_dict, second_storage_dict
 
 
@@ -85,7 +126,9 @@ def collect_from_steps(json_output):
     for element in json_output:
         # collect trace and related information and store individually
         new_trace = element["trace"]
-        address_list, storage_change_dict, second_storage_dict = collect_state_changes(new_trace["steps"])
+        address_list, storage_change_dict, second_storage_dict = collect_state_changes(
+            new_trace.get("steps") or [], contract=new_trace.get("address")
+        )
         address_list = strict_extend(address_list, [new_trace["caller"].lower(), new_trace["address"].lower()])
         idx = element["idx"]
         trace_address_dict[idx] = address_list

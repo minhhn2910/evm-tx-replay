@@ -110,6 +110,14 @@ def _cast_error_detail(result):
     return f"cast exited {result.returncode}"
 
 
+OPTIONAL_CAST_FLAGS = ("--prestate-tracer", "--disable-external-identification")
+
+
+def _unknown_flag_error(detail):
+    text = (detail or "").lower()
+    return "unexpected argument" in text or "unrecognized" in text
+
+
 def run_cast(*args, rpc_timeout=300):
     """
     Run `cast` and return stdout.
@@ -119,6 +127,7 @@ def run_cast(*args, rpc_timeout=300):
 
     stdin is closed so `docker exec -i ... cast "$@"` does not inherit the
     parent stdin. On failure, raise with a short error (not the full trace).
+    Newer flags are dropped and retried on older cast builds.
     """
     cmd = [cast_bin, *args]
     if "--rpc-timeout" not in args:
@@ -130,6 +139,11 @@ def run_cast(*args, rpc_timeout=300):
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(_cast_error_detail(result))
+        detail = _cast_error_detail(result)
+        if _unknown_flag_error(detail):
+            filtered = tuple(a for a in args if a not in OPTIONAL_CAST_FLAGS)
+            if filtered != args:
+                return run_cast(*filtered, rpc_timeout=rpc_timeout)
+        raise RuntimeError(detail)
     return result.stdout
 

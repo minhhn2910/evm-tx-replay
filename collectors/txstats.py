@@ -14,7 +14,7 @@ from utils.tools import (
     get_statistics,
     convert_hexbytes_to_str,
 )
-from utils.collect_pre import collect_from_steps
+from utils.collect_pre import collect_from_steps, step_op_key, step_stack, step_memory_size
 from utils.opcodes import OPCODE_MAP
 
 
@@ -30,23 +30,24 @@ def process_reference(opcode_counts):
     return dict(sorted(result.items(), key=lambda x: (-x[1], x[0])))
 
 
-def collect_steps(steps):
+def collect_steps(steps, trace=None):
     """Collect information from execution steps."""
     opcode_list = []
     stack_size_list = []
     memory_size_list = []
     accessed_addresses = set()
-    max_depth = 0
+    parent_depth = (trace or {}).get("depth") or 1
+    parent_address = (trace or {}).get("address")
+    max_depth = parent_depth
 
     for step in steps:
-        op_code = hex(step["op"])[2:].upper()
-        opcode_list.append(op_code)
-        max_depth = max(max_depth, step["depth"])
-        stack_size_list.append(len(step["stack"]))
-        memory_size_list.append((len(step["memory"]) - 2) / 2)
-        accessed_addresses.add(step.get("contract"))
+        opcode_list.append(step_op_key(step))
+        max_depth = max(max_depth, step.get("depth") or parent_depth)
+        stack_size_list.append(len(step_stack(step)))
+        memory_size_list.append(step_memory_size(step))
+        accessed_addresses.add(step.get("contract") or parent_address)
 
-    accessed_addresses = sorted(accessed_addresses, key=str)
+    accessed_addresses = sorted((a for a in accessed_addresses if a), key=str)
 
     return {
         "opcodes": opcode_list,
@@ -115,8 +116,7 @@ def collect_lists(result_list):
 
     # Add results to each list
     for t in trace_list:
-        steps = t["steps"]
-        output_dict = collect_steps(steps)
+        output_dict = collect_steps(t.get("steps") or [], t)
         full_opcode_list.extend(output_dict["opcodes"])
         full_stack_size_list.extend(output_dict["stack_sizes"])
         full_memory_size_list.extend(output_dict["memory_sizes"])

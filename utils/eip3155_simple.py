@@ -84,15 +84,19 @@ def build_gas_lookup_from_arena(arena: List[Dict[str, Any]]) -> tuple[Dict[Tuple
             continue
 
         steps = trace.get("steps", [])
+        parent_depth = trace.get("depth", 1)
         for step in steps:
-            depth = step.get("depth", 1)
+            depth = step.get("depth", parent_depth)
             pc = step.get("pc", 0)
             op = step.get("op", 0)
-            stack = step.get("stack", [])
+            if isinstance(op, dict):
+                op = op.get("code", 0)
+            stack = step.get("stack") or []
+            if not isinstance(stack, (list, tuple)):
+                stack = []
             gas_remaining = step.get("gas_remaining", 0)
             gas_cost = step.get("gas_cost", 0)
 
-            # Convert stack to tuple for hashability
             stack_tuple = tuple(stack)
             key = (depth, pc, op, stack_tuple)
             gas_lookup[key] = gas_remaining
