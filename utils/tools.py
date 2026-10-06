@@ -1,11 +1,10 @@
 import json
 import statistics
-import subprocess
 import time
 from collections import Counter
 from collections.abc import Mapping
 from hexbytes import HexBytes
-from utils.rpc import cast_bin
+from utils.rpc import run_cast
 
 
 def is_tx(tx_line: str):
@@ -173,11 +172,19 @@ def cast_run(transaction_hash, rpc_url, trace_printer=False):
     Returns:
         Tuple of (trace_lines, arena)
     """
-    command = [cast_bin, "run", transaction_hash, "-r", rpc_url, "-vvvvv", "--json", "--no-rate-limit"]
+    args = [
+        "run",
+        transaction_hash,
+        "-r",
+        rpc_url,
+        "-vvvvv",
+        "--json",
+        "--no-rate-limit",
+        "--prestate-tracer",
+    ]
     if trace_printer:
-        command.append("-t")
-
-    stdout = subprocess.run(command, capture_output=True, text=True, check=True).stdout
+        args.append("-t")
+    stdout = run_cast(*args)
 
     # The arena is the final line, so everything before it is the opcode trace
     json_start = stdout.rstrip().rfind("\n") + 1

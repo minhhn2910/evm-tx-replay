@@ -1,23 +1,13 @@
 # Function to collect transaction traces and save them as JSON files
 import json
-import subprocess
 from utils.tools import make_hex_even
-from utils.rpc import cast_bin
+from utils.rpc import run_cast
 
 
 # collect block using foundry cast
 def cast_block_run(block_number, rpc_url):
-    # define the command
-    command = [cast_bin, "block", str(block_number), "--rpc-url", rpc_url, "--json"]
-
-    # run the command and capture the output
-    block_result = subprocess.run(command, capture_output=True, text=True, check=True)
-
-    # load block related data
-    text_output = block_result.stdout.strip()
-    block_data = json.loads(text_output)
-
-    return block_data
+    text_output = run_cast("block", str(block_number), "--rpc-url", rpc_url, "--json")
+    return json.loads(text_output.strip())
 
 
 def collect_env(block_number, rpc_url):
