@@ -51,6 +51,12 @@ python main.py --block 18000000
 
 # Process multiple transactions from file
 python main.py --file transactions.txt
+
+# IPC socket (local node, no HTTP)
+python main.py --endpoint /tmp/reth.ipc --block 18000000
+
+# Fast mode: call tree + state diff only (no EIP-3155, uses debug_trace*)
+python main.py --fast --block 18000000
 ```
 
 ## Usage
@@ -63,10 +69,12 @@ python main.py [OPTIONS] COMMAND
 
 #### Options
 
-- `--endpoint URL`: RPC endpoint URL (default: http://localhost:8545)
+- `--endpoint URL`: RPC endpoint URL, `host:port`, or IPC socket path (default: http://localhost:8545)
 - `-o, --output DIR`: Output directory for results
 - `--overwrite`: Overwrite existing results
 - `--max-attempts N`: Maximum retry attempts for batch operations (default: 3)
+- `-j, --jobs N`: Collect transactions concurrently (default: 1)
+- `--fast`: Collect only the call tree (`txCalls.json`) and state diff (`txStateDiff.json`) via `debug_trace*`, skipping the EIP-3155 opcode trace
 
 #### Commands
 
@@ -87,6 +95,15 @@ result/
     ├── txTest.json           # Environment and transaction info
     ├── txStats.json          # Execution statistics
     └── txTraceEIP3155.json   # EIP-3155 execution trace
+```
+
+With `--fast`:
+
+```
+result/
+└── <tx_hash>/
+    ├── txCalls.json          # callTracer call tree
+    └── txStateDiff.json      # prestateTracer diffMode pre/post
 ```
 
 
