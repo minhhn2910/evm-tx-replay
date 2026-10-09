@@ -79,7 +79,7 @@ def collect_multiple_transactions(
         output_folder: Base folder for output files
         overwrite: Whether to overwrite existing results
         endpoint: RPC endpoint URL
-        fast: Collect call tree and state diff instead of an EIP-3155 trace
+        fast: Collect call tree and storage reads/writes instead of an EIP-3155 trace
 
     Returns:
         Number of successfully processed transactions

@@ -84,7 +84,7 @@ def collect_from_file(
         max_attempts: Maximum retry attempts per transaction
         endpoint: RPC endpoint URL
         jobs: Number of transactions to collect concurrently
-        fast: Collect call tree and state diff instead of an EIP-3155 trace
+        fast: Collect call tree and storage reads/writes instead of an EIP-3155 trace
 
     Returns:
         Dictionary with timing statistics
@@ -125,7 +125,7 @@ def collect_from_block(
         max_attempts: Maximum retry attempts per transaction
         endpoint: RPC endpoint URL
         jobs: Number of transactions to collect concurrently
-        fast: Collect call tree and state diff instead of an EIP-3155 trace
+        fast: Collect call tree and storage reads/writes instead of an EIP-3155 trace
 
     Returns:
         Dictionary with timing statistics

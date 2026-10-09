@@ -46,7 +46,7 @@ Examples:
   # Over an IPC socket instead of HTTP
   python main.py --endpoint /tmp/reth.ipc --block 18000000
 
-  # Fast mode: call tree and state diff only, no EIP-3155 trace
+  # Fast mode: call tree and storage reads/writes, no EIP-3155 trace
   python main.py --fast --block 18000000
 
   # Collect a block with 8 transactions in flight at a time
@@ -71,7 +71,7 @@ Examples:
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Collect only the call tree and state diff via debug_trace*, skipping the EIP-3155 trace",
+        help="Collect the call tree and storage reads/writes via debug_trace*, skipping the EIP-3155 trace",
     )
 
     # Command options (mutually exclusive)
