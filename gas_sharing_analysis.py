@@ -15,8 +15,11 @@ Full trace (raw_block/<block>/<tx>/txTraceEIP3155.json):
            tx_warm = accessed earlier in the same tx
     evm    repeat = accessed earlier in the range or charged warm,
            tx_warm = charged warm by the EVM (gasCost, includes access lists)
-  Saving = (repeat and not tx_warm) ops x (2100 - --warm-cost): every range
-  repeat is charged warm instead of only the repeats inside each tx.
+  SLOAD saving = (range hit and not same-tx warm) x max(0, EIP-3155 gasCost
+  - --warm-cost). SSTORE saving = range hit x max(0, gasCost -
+  --sstore-warm-cost). KECCAK256 / STATICCALL hits cost --cache-hit-cost
+  (default 3) instead of the real gas. Also reports repeats whose earlier
+  access is in the same block.
 
 RPC (--endpoint): header gasUsed and tx count per block, the average tx gas,
 and a check that the traced block gas equals the header.
@@ -28,7 +31,9 @@ Gas definitions:
                    includes precompile frames and CREATE code deposit, which the
                    EIP-3155 steps do not show
   static call gas  inclusive gasUsed of STATICCALLs not nested in a STATICCALL
-  saved gas        inclusive gasUsed of a cache hit; its subtree is skipped
+  saved gas        actual op/frame gas minus the configured cache/warm cost;
+                   STATICCALL still skips the subtree so nested hits are not
+                   double-counted
 
 Limitations:
   - callTracer gasUsed excludes the caller-side call overhead (cold/warm
@@ -36,9 +41,9 @@ Limitations:
   - Caches are oracles keyed on exact outputs: no state invalidation, and they
     are cold at --start-block, so longer ranges find more repeats.
   - Tx order inside a block is the collection mtime order.
-  - A cold access is credited 2100 - warm_cost for SSTORE too; EIP-2929 would
-    remove exactly the 2100 surcharge. Slots warmed in a reverted frame turn
-    cold again, so a few credited accesses were seen earlier in the same tx.
+  - Cached SSTORE is charged --sstore-warm-cost instead of the real 100/2900/
+    20000/22100. That is an ideal skip of the write, not EIP-2929's 2100
+    surcharge. Slots warmed in a reverted frame turn cold again.
   - EIP-2930 access lists pre-warm slots: the count model treats their first
     touch as cold and credits a saving the EVM already gives; the evm model
     does not.
@@ -188,18 +193,18 @@ def account_gas(root: dict, stats: Counter) -> None:
     visit(root, True, False)
 
 
-def cache_walk(node: dict, hit, stats: Counter, case: str) -> None:
+def cache_walk(node: dict, hit, stats: Counter, case: str, cache_hit_cost: int) -> None:
     if is_static(node) and not node.get("error"):
         key = ((node.get("to") or "").lower(), (node.get("input") or "0x").lower())
         if hit(key, (node.get("output") or "0x").lower()):
             stats[f"{case}_hits"] += 1
-            stats[f"{case}_saved"] += gas(node)
+            stats[f"{case}_saved"] += max(0, gas(node) - cache_hit_cost)
             return
     for child in node.get("calls") or []:
-        cache_walk(child, hit, stats, case)
+        cache_walk(child, hit, stats, case, cache_hit_cost)
 
 
-def analyze_static(data_dir: Path, start_block: int, n_blocks: int) -> tuple[dict, dict]:
+def analyze_static(data_dir: Path, start_block: int, n_blocks: int, cache_hit_cost: int) -> tuple[dict, dict]:
     blocks: dict[int, Counter] = {}
     hits = {case: make() for case, (_, make) in CASES.items()}
 
@@ -211,11 +216,12 @@ def analyze_static(data_dir: Path, start_block: int, n_blocks: int) -> tuple[dic
         stats = blocks.setdefault(block, Counter())
         account_gas(root, stats)
         for case, hit in hits.items():
-            cache_walk(root, hit, stats, case)
+            cache_walk(root, hit, stats, case, cache_hit_cost)
 
     total = sum(blocks.values(), Counter())
     report = {
         "blocks": len(blocks),
+        "cache_hit_cost": cache_hit_cost,
         "static_calls": total["static_calls"],
         "gas": {"block": total["block_gas"], "call": total["call_gas"], "static": total["static_gas"]},
         "share_of_block_gas_pct": {
@@ -239,7 +245,10 @@ def analyze_static(data_dir: Path, start_block: int, n_blocks: int) -> tuple[dic
 
 def print_static(report: dict) -> None:
     gas_totals = report["gas"]
-    print(f"  blocks {report['blocks']}  static calls {report['static_calls']}")
+    print(
+        f"  blocks {report['blocks']}  static calls {report['static_calls']}"
+        f"  cache hit cost {report.get('cache_hit_cost', 3)}"
+    )
     print(f"  gas: block {gas_totals['block']}  call {gas_totals['call']}  static {gas_totals['static']}")
     print(f"    call gas / block gas              {fmt(report['share_of_block_gas_pct']['call'])}")
     print(f"    static call gas / block gas       {fmt(report['share_of_block_gas_pct']['static'])}")
@@ -289,11 +298,24 @@ def address(word) -> str:
     return f"0x{as_int(word) & ADDRESS_MASK:040x}"
 
 
-def scan_trace(tx_dir: Path, root_to: str | None, seen_slots: set, seen_hashes: set, stats: Counter) -> None:
+def scan_trace(
+    tx_dir: Path,
+    root_to: str | None,
+    seen_slots: set,
+    seen_block: set,
+    seen_hashes: set,
+    stats: Counter,
+    warm_cost: int,
+    sstore_warm_cost: int,
+    cache_hit_cost: int,
+) -> None:
     """root_to is the callTracer root `to`: the tx target, or the created address for a creation tx.
 
     Per SLOAD/SSTORE, both models count `repeat` (seen before in the range),
-    `tx_warm` (warm within the tx) and `saving_ops` (repeat but not tx_warm).
+    `tx_warm` (warm within the tx), and `block_repeat` (seen earlier in this block).
+    SLOAD saves max(0, EIP-3155 gasCost - warm_cost) on range hits that are not same-tx warm.
+    SSTORE saves max(0, gasCost - sstore_warm_cost) on every range hit.
+    KECCAK256 saves max(0, gasCost - cache_hit_cost) on a repeated output.
     """
     ctx = [address(root_to) if root_to else f"create:{tx_dir.name}"]
     creates = itertools.count()
@@ -308,17 +330,28 @@ def scan_trace(tx_dir: Path, root_to: str | None, seen_slots: set, seen_hashes: 
         if op in DATA_OPS and stack:
             name = DATA_OPS[op]
             key = (ctx[-1], as_int(stack[-1]))
-            in_tx, in_range = key in seen_tx, key in seen_slots
+            in_tx, in_block, in_range = key in seen_tx, key in seen_block, key in seen_slots
             evm_warm = cost != COLD_COST if op == SLOAD else cost not in SSTORE_COLD
             stats[name] += 1
             stats[f"{name}_gas"] += cost
             stats["data_ops"] += 1
             stats["data_gas"] += cost
+            stats[f"{name}_block_repeat"] += in_block
             for model, (repeat, tx_warm) in (("count", (in_range, in_tx)), ("evm", (in_range or evm_warm, evm_warm))):
                 stats[f"{name}_{model}_repeat"] += repeat
                 stats[f"{name}_{model}_tx_warm"] += tx_warm
-                stats[f"{name}_{model}_saving_ops"] += repeat and not tx_warm
+                if not repeat:
+                    continue
+                if name == "sload":
+                    if tx_warm:
+                        continue
+                    stats[f"{name}_{model}_saving_ops"] += 1
+                    stats[f"{name}_{model}_saved"] += max(0, cost - warm_cost)
+                else:
+                    stats[f"{name}_{model}_saving_ops"] += 1
+                    stats[f"{name}_{model}_saved"] += max(0, cost - sstore_warm_cost)
             seen_tx.add(key)
+            seen_block.add(key)
             seen_slots.add(key)
 
         elif op == KECCAK256 and nxt and nxt.get("stack"):
@@ -327,7 +360,7 @@ def scan_trace(tx_dir: Path, root_to: str | None, seen_slots: set, seen_hashes: 
             stats["hash_gas"] += cost
             if output in seen_hashes:
                 stats["hash_same"] += 1
-                stats["hash_saved"] += cost
+                stats["hash_saved"] += max(0, cost - cache_hit_cost)
             seen_hashes.add(output)
 
         if nxt and nxt["depth"] == depth + 1:
@@ -352,16 +385,27 @@ def scan_trace(tx_dir: Path, root_to: str | None, seen_slots: set, seen_hashes: 
 
 
 def analyze_full_trace(
-    trace_dir: Path, data_dir: Path, start_block: int, n_blocks: int, warm_cost: int
+    trace_dir: Path,
+    data_dir: Path,
+    start_block: int,
+    n_blocks: int,
+    warm_cost: int,
+    sstore_warm_cost: int,
+    cache_hit_cost: int,
 ) -> tuple[dict, dict]:
     blocks: dict[int, Counter] = {}
     seen_slots: set = set()
     seen_hashes: set = set()
+    seen_block: set = set()
+    current_block = None
 
     print("Full trace: SLOAD/SSTORE and KECCAK256 sharing")
     for block, tx_dir in iter_txs(trace_dir, start_block, n_blocks):
         if not (tx_dir / "txTraceEIP3155.json").is_file():
             continue
+        if block != current_block:
+            seen_block = set()
+            current_block = block
         stats = blocks.setdefault(block, Counter())
         root = load_json(data_dir / str(block) / tx_dir.name / "txCalls.json")
         if root:
@@ -369,12 +413,20 @@ def analyze_full_trace(
         else:
             stats["missing_block_gas"] += 1
         stats["txs"] += 1
-        scan_trace(tx_dir, (root or {}).get("to"), seen_slots, seen_hashes, stats)
+        scan_trace(
+            tx_dir,
+            (root or {}).get("to"),
+            seen_slots,
+            seen_block,
+            seen_hashes,
+            stats,
+            warm_cost,
+            sstore_warm_cost,
+            cache_hit_cost,
+        )
 
     for stats in blocks.values():
         for model in MODELS:
-            for name in DATA_OPS.values():
-                stats[f"{name}_{model}_saved"] = stats[f"{name}_{model}_saving_ops"] * (COLD_COST - warm_cost)
             stats[f"data_{model}_repeat"] = sum(stats[f"{name}_{model}_repeat"] for name in DATA_OPS.values())
             stats[f"data_{model}_saved"] = sum(stats[f"{name}_{model}_saved"] for name in DATA_OPS.values())
 
@@ -387,6 +439,7 @@ def analyze_full_trace(
         return {
             "ops": total[name],
             "repeat_pct": pct_summary(blocks, f"{prefix}_repeat", name),
+            "block_repeat_pct": pct_summary(blocks, f"{name}_block_repeat", name),
             "tx_warm_pct": pct_summary(blocks, f"{prefix}_tx_warm", name),
             "saving_ops": total[f"{prefix}_saving_ops"],
             "saved_gas": total[f"{prefix}_saved"],
@@ -398,6 +451,8 @@ def analyze_full_trace(
         "blocks": len(blocks),
         "txs": total["txs"],
         "warm_cost": warm_cost,
+        "sstore_warm_cost": sstore_warm_cost,
+        "cache_hit_cost": cache_hit_cost,
         "totals": {k: total[k] for k in sorted(total)},
         "data_access_gas_share_pct": pct_summary(blocks, "data_gas", "block_gas"),
         "data_access": {
@@ -426,7 +481,10 @@ def analyze_full_trace(
 def print_full_trace(report: dict) -> None:
     t = report["totals"]
     print(f"  blocks {report['blocks']}  txs {report['txs']}  block gas {t.get('block_gas', 0)}")
-    print(f"  SLOAD {t.get('sload', 0)}  SSTORE {t.get('sstore', 0)}  warm cost {report['warm_cost']}")
+    print(
+        f"  SLOAD {t.get('sload', 0)}  SSTORE {t.get('sstore', 0)}"
+        f"  SLOAD warm {report['warm_cost']}  SSTORE cache {report['sstore_warm_cost']}"
+    )
     print(f"    data access gas / block gas       {fmt(report['data_access_gas_share_pct'])}")
     for model, stats in report["data_access"].items():
         print(f"  model {model}: {stats['description']}")
@@ -434,60 +492,21 @@ def print_full_trace(report: dict) -> None:
             op = stats[name]
             label = name.upper()
             print(f"    {label:<6} repeated in range         {fmt(op['repeat_pct'])}")
+            print(f"    {label:<6} repeated in same block    {fmt(op['block_repeat_pct'])}")
             print(f"    {label:<6} warm in same tx           {fmt(op['tx_warm_pct'])}")
             print(f"    {label:<6} saved / block gas         {fmt(op['saved_pct_block'])}")
             print(f"    {label:<6} saved / own op gas        {fmt(op['saved_pct_op'])}")
             print(f"    {label:<6} {op['saving_ops']} saving ops, {op['saved_gas']} gas saved")
         print(f"    ALL    repeated in range         {fmt(stats['all']['repeat_pct'])}")
         print(f"    ALL    saved / block gas         {fmt(stats['all']['saved_pct_block'])}")
-    print(f"  KECCAK256 {t.get('hash_ops', 0)}  same output {t.get('hash_same', 0)}  saved {t.get('hash_saved', 0)}")
+    print(
+        f"  KECCAK256 {t.get('hash_ops', 0)}  same output {t.get('hash_same', 0)}"
+        f"  saved {t.get('hash_saved', 0)}  cache hit cost {report.get('cache_hit_cost', 3)}"
+    )
     print(f"    hash gas / block gas              {fmt(report['hash_gas_share_pct'])}")
     print(f"    same output / KECCAK256           {fmt(report['hash_same_output_pct'])}")
     print(f"    hash saved / block gas            {fmt(report['hash_saved_pct']['block'])}")
     print(f"    hash saved / hash gas             {fmt(report['hash_saved_pct']['hash'])}")
-
-
-# ---------------------------------------------------------------------------
-# Paper-style summary
-# ---------------------------------------------------------------------------
-
-def print_summary(static: dict, full: dict | None) -> None:
-    na = "n/a (needs full EIP-3155 trace)"
-    static_a = static["cases"]["A"]
-    static_same = f"{static_a['same_input_output_pct']['aggregate']:.2f}%"
-    static_saved = static_a["reduction_pct"]["block"]["mean"]
-
-    if full:
-        share = full["data_access_gas_share_pct"]
-        data_share = f"{share['mean']:.2f}% (min {share['min']:.2f}%)"
-        same_slot = f"{full['data_access']['count']['all']['repeat_pct']['max']:.2f}%"
-        hash_same = f"{full['hash_same_output_pct']['aggregate']:.2f}%"
-        saved = full["data_access"]["evm"]["all"]["saved_pct_block"]
-        counted = full["data_access"]["count"]["all"]["saved_pct_block"]
-        data_saved = (
-            f"{saved['max']:.2f}% ({saved['mean']:.2f}% on average;"
-            f" pure counting {counted['max']:.2f}% / {counted['mean']:.2f}%)"
-        )
-        hash_saved = full["hash_saved_pct"]["block"]["mean"]
-        shared = (
-            f"{hash_saved + static_saved:.2f}% (hashing {hash_saved:.2f}% + static calls {static_saved:.2f}%,"
-            " an upper bound since hashes inside cached static calls count twice)"
-        )
-    else:
-        data_share = same_slot = hash_same = data_saved = na
-        shared = f"{static_saved:.2f}% from static calls; hashing {na}"
-
-    print("\nSummary")
-    print(
-        f"  We find that data access accounts for more than {data_share} of total gas per block,"
-        f" and up to {same_slot} of data access operations involve the same addresses."
-        f" Our analysis also identifies {hash_same} of hashing and {static_same} of static call"
-        " operations having the same input and output, making them amenable to gas sharing."
-        " We evaluate the amount of potential gas saving under a real Ethereum workload and an"
-        " ideal cross-transaction cache. The results show that sharing data access operations"
-        f" can achieve up to {data_saved} gas reduction, while sharing hashing and static call"
-        f" operations can lead to {shared} reduction."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +525,13 @@ def parse_args():
     parser.add_argument("--range", dest="n_blocks", type=int, required=True, help="Number of consecutive blocks")
     parser.add_argument("--data-dir", default="block_result", help="Fast trace root (txCalls.json)")
     parser.add_argument("--trace-dir", default="raw_block", help="Full trace root (txTraceEIP3155.json)")
-    parser.add_argument("--warm-cost", type=int, default=100, help="Gas of a shared (warm) storage access")
+    parser.add_argument("--warm-cost", type=int, default=100, help="Gas of a shared (warm) SLOAD")
+    parser.add_argument(
+        "--sstore-warm-cost", type=int, default=100, help="Gas of a cached SSTORE (replaces the real gasCost)"
+    )
+    parser.add_argument(
+        "--cache-hit-cost", type=int, default=3, help="Gas of a cached STATICCALL or KECCAK256 (default 3)"
+    )
     parser.add_argument(
         "--endpoint", default="http://localhost:8545", help="RPC for block headers; empty string skips the check"
     )
@@ -516,6 +541,10 @@ def parse_args():
         parser.error("--range must be >= 1")
     if not 0 <= args.warm_cost <= COLD_COST:
         parser.error(f"--warm-cost must be between 0 and {COLD_COST}")
+    if args.sstore_warm_cost < 0:
+        parser.error("--sstore-warm-cost must be >= 0")
+    if args.cache_hit_cost < 0:
+        parser.error("--cache-hit-cost must be >= 0")
     return args
 
 
@@ -523,7 +552,7 @@ def analyze_interval(args, data_dir: Path, trace_dir: Path, start_block: int) ->
     end_block = start_block + args.n_blocks - 1
     print(f"\n===== interval {start_block}..{end_block} ({args.n_blocks} blocks) =====")
 
-    static, static_blocks = analyze_static(data_dir, start_block, args.n_blocks)
+    static, static_blocks = analyze_static(data_dir, start_block, args.n_blocks, args.cache_hit_cost)
     print_static(static)
 
     headers = None
@@ -532,14 +561,21 @@ def analyze_interval(args, data_dir: Path, trace_dir: Path, start_block: int) ->
 
     full = None
     if trace_dir.is_dir():
-        full, _ = analyze_full_trace(trace_dir, data_dir, start_block, args.n_blocks, args.warm_cost)
+        full, _ = analyze_full_trace(
+            trace_dir,
+            data_dir,
+            start_block,
+            args.n_blocks,
+            args.warm_cost,
+            args.sstore_warm_cost,
+            args.cache_hit_cost,
+        )
         print_full_trace(full)
         if not full["blocks"]:
             full = None
     else:
         print(f"No full trace directory {trace_dir}; skipping SLOAD/SSTORE and KECCAK256 stats", file=sys.stderr)
 
-    print_summary(static, full)
     return {
         "start_block": start_block,
         "end_block": end_block,
@@ -561,7 +597,6 @@ def print_average(average: dict) -> None:
         )
     if average.get("full_trace"):
         print_full_trace(average["full_trace"])
-    print_summary(average["static"], average.get("full_trace"))
 
 
 def main():
