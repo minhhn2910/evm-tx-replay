@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """Opcode frequency and gas over one or more block intervals.
 
-Collect header gas first, then plot. Counts and gas are pooled across every
-interval (not averaged per interval).
+Summarize traces once, then plot any interval from that summary. Opcode gas
+share uses the receipt gas of transactions that are not simple transfers.
 
-Opcode gas is the gas the trace actually consumed. A call's gasCost includes
-gas forwarded to the callee; the negative gasCost on return is the unused part
-coming back, so it is subtracted from that call. The callee's own steps keep
-their gasCost. Gas share is that sum divided by header gasUsed (all gas the
-blocks consumed).
-
-  python combined_data_analysis.py --collect-gas --start-block 24000000,24100000 --range 5 -o block_gas.json
-  python combined_data_analysis.py --plot --gas-file block_gas.json --start-block 24000000,24100000 --range 5 -o opcodes.pdf
-  python combined_data_analysis.py --horizontal-bar --gas-file block_gas.json --start-block 24000000,24100000 --range 5 -o opcodes.pdf
+  python combined_data_analysis.py --summarize --trace-dir raw_block --data-dir block_result --summary-dir opcode_summary --start-block 24000000,24100000 --range 5 --jobs 8
+  python combined_data_analysis.py --horizontal-bar --summary-dir opcode_summary --start-block 24000000 --range 2 --call-gas own -o opcodes.pdf
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import matplotlib
@@ -28,9 +24,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from data_analysis import as_int, iter_txs
+from data_analysis import as_int
 from gas_sharing_analysis import parse_start_blocks
-from utils.opcodes import get_opcode_name
+from tx_opcode_summary import summarize_tx
 from utils.rpc import normalize_endpoint, rpc_call
 
 FORCED = ("SLOAD", "SSTORE", "KECCAK256", "CALL", "STATICCALL")
@@ -65,80 +61,179 @@ def interval_blocks(starts: list[int], n_blocks: int) -> list[int]:
     return blocks
 
 
-def opcode_name(op: int) -> str:
-    name = get_opcode_name(hex(op)[2:])
-    return "KECCAK256" if name == "SHA3" else name
-
-
 def collect_block_gas(endpoint: str, blocks: list[int], output: Path) -> None:
     gas = {}
     for block in blocks:
         header = rpc_call(endpoint, "eth_getBlockByNumber", [hex(block), False])
-        gas[str(block)] = as_int(header["gasUsed"])
-        print(f"  block {block}: gasUsed {gas[str(block)]}")
+        record = {"gasUsed": as_int(header["gasUsed"]), "txs": len(header["transactions"])}
+        gas[str(block)] = record
+        print(f"  block {block}: gasUsed {record['gasUsed']}  txs {record['txs']}")
     output.write_text(json.dumps(gas, indent=2), encoding="utf-8")
     print(f"Wrote {output}")
+    total_gas = sum(record["gasUsed"] for record in gas.values())
+    total_txs = sum(record["txs"] for record in gas.values())
+    print(f"transactions {total_txs}  gas used {total_gas}")
 
 
-CALLS = {"CALL", "STATICCALL", "DELEGATECALL", "CALLCODE", "CREATE", "CREATE2"}
+def hex_hash(value) -> str:
+    text = value.hex() if hasattr(value, "hex") and not isinstance(value, str) else str(value)
+    text = text.lower()
+    return text if text.startswith("0x") else "0x" + text
 
 
-def scan_opcodes(trace_dir: Path, blocks: list[int]) -> tuple[Counter, Counter, int]:
-    """Return (step counts, gas actually consumed, number of txs).
+def fetch_block(endpoint: str, block: int) -> tuple[list[str], int, dict[str, int]]:
+    """Transaction order, header gasUsed, and receipt gasUsed keyed by hash."""
+    header = rpc_call(endpoint, "eth_getBlockByNumber", [hex(block), False])
+    receipts = rpc_call(endpoint, "eth_getBlockReceipts", [hex(block)])
+    order = [hex_hash(tx) for tx in header["transactions"]]
+    gas_by_tx = {hex_hash(receipt["transactionHash"]): as_int(receipt["gasUsed"]) for receipt in receipts}
+    return order, as_int(header["gasUsed"]), gas_by_tx
 
-    gasCost on a call is the drop from the caller's gas to the callee's gas, so
-    it includes the gas forwarded to the callee. The unused part is a negative
-    gasCost on the first opcode after the call returns; that amount is subtracted
-    from the call. A precompile never changes depth, so the same negative on the
-    next opcode is subtracted from that call. The total equals the gas counter
-    drop across the trace.
-    """
+
+def merge_ops(dst: dict, src: dict) -> None:
+    for name, row in src.items():
+        current = dst.setdefault(name, [0] * len(row))
+        if len(current) < len(row):
+            current.extend([0] * (len(row) - len(current)))
+        for index, value in enumerate(row):
+            current[index] += value
+
+
+def has_trace(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _drop_parts(block_dir: Path) -> None:
+    parts = block_dir / "parts"
+    if parts.is_dir():
+        shutil.rmtree(parts)
+    leftover = block_dir / "opcodes.jsonl"
+    if leftover.is_file():
+        leftover.unlink()
+
+
+def summarize_blocks(endpoint: str, trace_dir: Path, data_dir: Path, summary_dir: Path, blocks: list[int], jobs: int, resume: bool) -> None:
+    """Write txs.jsonl and block.json for each block. One process per transaction."""
+    all_txs = all_gas = analysis_txs = analysis_gas = 0
+    for block in blocks:
+        block_dir = summary_dir / str(block)
+        txs_path = block_dir / "txs.jsonl"
+        block_path = block_dir / "block.json"
+        if resume and txs_path.is_file() and block_path.is_file():
+            record = json.loads(block_path.read_text(encoding="utf-8"))
+            _drop_parts(block_dir)
+            print(
+                f"  block {block}: resume  txs {record['txs']}  simple {record['simpleTxs']}  "
+                f"gas {record['gasUsed']}  denom {record['denomGas']}"
+            )
+            all_txs += record["txs"]
+            all_gas += record["gasUsed"]
+            analysis_txs += record["txs"] - record["simpleTxs"]
+            analysis_gas += record["denomGas"]
+            continue
+
+        order, header_gas, gas_by_tx = fetch_block(endpoint, block)
+        missing = [tx for tx in order if tx not in gas_by_tx]
+        if missing:
+            raise SystemExit(f"block {block} receipts have no gas for {missing[:4]}")
+        receipt_gas = sum(gas_by_tx[tx] for tx in order)
+        if receipt_gas != header_gas:
+            print(f"  warning: block {block} receipts {receipt_gas} != header gas {header_gas}", file=sys.stderr)
+
+        block_dir.mkdir(parents=True, exist_ok=True)
+        cached: dict[str, dict] = {}
+        tasks = []
+        simple = set()
+        for tx in order:
+            trace = trace_dir / str(block) / tx / "txTraceEIP3155.json"
+            if gas_by_tx[tx] == 21000 or not has_trace(trace):
+                simple.add(tx)
+                continue
+            tasks.append((str(trace), str(data_dir / str(block) / tx), tx))
+
+        if tasks:
+            with ProcessPoolExecutor(max_workers=jobs) as pool:
+                futures = {pool.submit(summarize_tx, *task): task[2] for task in tasks}
+                for future in as_completed(futures):
+                    tx = futures[future]
+                    cached[tx] = future.result()
+
+        with txs_path.open("w", encoding="utf-8") as handle:
+            for index, tx in enumerate(order):
+                record = {"tx": tx, "n": index, "gasUsed": gas_by_tx[tx], "simple": tx in simple}
+                if tx not in simple:
+                    record["ops"] = cached[tx]["ops"]
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+        merged: dict = {}
+        exec_gas = mismatches = unmatched = 0
+        for tx, totals in cached.items():
+            merge_ops(merged, totals["op"])
+            exec_gas += totals["exec"]
+            mismatches += totals["sstore_mismatch"]
+            unmatched += totals["static_unmatched"]
+        simple_gas = sum(gas_by_tx[tx] for tx in simple)
+        denom_gas = sum(gas_by_tx[tx] for tx in order if tx not in simple)
+        record = {
+            "block": block,
+            "gasUsed": header_gas,
+            "txs": len(order),
+            "simpleTxs": len(simple),
+            "simpleGas": simple_gas,
+            "denomGas": denom_gas,
+            "execGas": exec_gas,
+            "opcodes": merged,
+            "sstoreMismatch": mismatches,
+            "staticUnmatched": unmatched,
+        }
+        (block_dir / "block.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
+        _drop_parts(block_dir)
+        print(
+            f"  block {block}: txs {len(order)}  simple {len(simple)}  "
+            f"gas {header_gas}  denom {denom_gas}  exec {exec_gas}"
+        )
+        if mismatches or unmatched:
+            print(f"    sstore mismatches {mismatches}  staticcall frames unmatched {unmatched}", file=sys.stderr)
+        all_txs += len(order)
+        all_gas += header_gas
+        analysis_txs += len(order) - len(simple)
+        analysis_gas += record["denomGas"]
+    print(f"transactions {all_txs}  gas used {all_gas}")
+    print(f"analysis transactions {analysis_txs}  analysis gas {analysis_gas}")
+
+
+def opcode_gas(row: list[int], call_gas: str) -> int:
+    """`own` is every opcode's own gas. `inside` uses call `direct` and other opcodes' depth-1 gas."""
+    if call_gas == "inside":
+        return row[3] if len(row) == 4 else row[2]
+    return row[1]
+
+
+def load_summary(summary_dir: Path, blocks: list[int], call_gas: str) -> dict:
+    """Pool block.json files. Gas share uses denomGas, which excludes simple transfers."""
     counts: Counter = Counter()
     gas: Counter = Counter()
-    txs = 0
+    all_txs = all_gas = analysis_txs = denom = 0
     for block in blocks:
-        for _block, tx_dir in iter_txs(trace_dir, block, 1):
-            path = tx_dir / "txTraceEIP3155.json"
-            if not path.is_file():
-                continue
-            txs += 1
-            open_calls: list[str] = []
-            prev_name = None
-            prev_depth = None
-            with path.open(encoding="utf-8") as trace:
-                for line in trace:
-                    if not line.strip():
-                        continue
-                    step = json.loads(line)
-                    name = opcode_name(as_int(step["op"]))
-                    cost = int(str(step["gasCost"]), 0)
-                    depth = step["depth"]
-                    if prev_name is not None:
-                        if depth == prev_depth + 1 and prev_name in CALLS:
-                            open_calls.append(prev_name)
-                        elif depth < prev_depth:
-                            if cost < 0 and open_calls:
-                                gas[open_calls[-1]] += cost
-                                cost = 0
-                            for _ in range(prev_depth - depth):
-                                if open_calls:
-                                    open_calls.pop()
-                        elif cost < 0 and prev_name in CALLS and depth == prev_depth:
-                            gas[prev_name] += cost
-                            cost = 0
-                    counts[name] += 1
-                    if cost > 0:
-                        gas[name] += cost
-                    prev_name, prev_depth = name, depth
-    return counts, gas, txs
-
-
-def load_block_gas(path: Path, blocks: list[int]) -> int:
-    saved = json.loads(path.read_text(encoding="utf-8"))
-    missing = [block for block in blocks if str(block) not in saved]
-    if missing:
-        raise SystemExit(f"gas file {path} has no entry for blocks {missing[:8]}")
-    return sum(int(saved[str(block)]) for block in blocks)
+        path = summary_dir / str(block) / "block.json"
+        if not path.is_file():
+            raise SystemExit(f"No summary for block {block} ({path}). Run --summarize first.")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        all_txs += record["txs"]
+        all_gas += record["gasUsed"]
+        analysis_txs += record["txs"] - record["simpleTxs"]
+        denom += record["denomGas"]
+        for name, row in record["opcodes"].items():
+            counts[name] += row[0]
+            gas[name] += opcode_gas(row, call_gas)
+    return {
+        "counts": counts,
+        "gas": gas,
+        "all_txs": all_txs,
+        "all_gas": all_gas,
+        "analysis_txs": analysis_txs,
+        "denom": denom,
+    }
 
 
 def ranked_positive(values: Counter) -> list[tuple[str, int]]:
@@ -244,7 +339,7 @@ def plot_pies(counts: Counter, gas: Counter, block_gas: int, output: Path, top: 
     draw_pie(axes[1], gas_slices, gas_pct, "(b) Opcode gas", font_size, gap=max(0, block_gas - opcode_gas))
     fig.tight_layout()
     save_figure(fig, output)
-    print(f"  steps {steps}  opcode gas {opcode_gas}  block gas {block_gas}")
+    print(f"  steps {steps}  opcode gas {opcode_gas}  denom gas {block_gas}")
     return count_pct, gas_pct
 
 
@@ -298,7 +393,7 @@ def plot_bars(
         columnspacing=1.2,
     )
     save_figure(fig, output)
-    print(f"  steps {steps}  opcode gas {sum(gas.values())}  block gas {block_gas}")
+    print(f"  steps {steps}  opcode gas {sum(gas.values())}  denom gas {block_gas}")
 
 
 def _label_bars(ax, values: list[float], font_size: float) -> None:
@@ -320,8 +415,9 @@ def _plain_axis(ax, title: str) -> None:
 def parse_args():
     parser = argparse.ArgumentParser(description="Opcode frequency and gas pies across block intervals.")
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--collect-gas", action="store_true", help="Save RPC header gasUsed for the intervals")
-    mode.add_argument("--plot", action="store_true", help="Plot opcode pies from traces and a gas file")
+    mode.add_argument("--collect-gas", action="store_true", help="Save RPC header gasUsed and tx count for the intervals")
+    mode.add_argument("--summarize", action="store_true", help="Reduce traces to opcode_summary (parallel per transaction)")
+    mode.add_argument("--plot", action="store_true", help="Plot opcode pies from a summary directory")
     mode.add_argument("--horizontal-bar", action="store_true", help="Paired horizontal bars of frequency and gas")
     parser.add_argument(
         "--start-block",
@@ -331,10 +427,20 @@ def parse_args():
         help="First block, or a comma-separated list of interval starts",
     )
     parser.add_argument("--range", dest="n_blocks", type=int, required=True, help="Blocks per interval")
-    parser.add_argument("--endpoint", default="http://localhost:8545", help="RPC endpoint for --collect-gas")
+    parser.add_argument("--endpoint", default="http://localhost:8545", help="RPC endpoint for --collect-gas and --summarize")
     parser.add_argument("--trace-dir", default="raw_block", help="Full-trace root (txTraceEIP3155.json)")
+    parser.add_argument("--data-dir", default="block_result", help="Fast-mode root (txCalls.json and storage)")
+    parser.add_argument("--summary-dir", default="opcode_summary", help="Stage-1 output read by the plot modes")
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="Worker processes for --summarize")
+    parser.add_argument("--resume", action="store_true", help="Skip a block that already has txs.jsonl and block.json")
+    parser.add_argument(
+        "--call-gas",
+        choices=("own", "inside"),
+        default="own",
+        help="own: each opcode's gas. inside: call gas includes the frame, other opcodes keep depth-1 gas",
+    )
     parser.add_argument("--gas-file", help="Block gas JSON written by --collect-gas")
-    parser.add_argument("-o", "--output", required=True, help="Gas JSON (--collect-gas) or PDF (--plot)")
+    parser.add_argument("-o", "--output", help="Gas JSON (--collect-gas) or PDF (--plot, --horizontal-bar)")
     parser.add_argument(
         "--top",
         type=int,
@@ -357,8 +463,10 @@ def parse_args():
         parser.error("--top must be >= 1")
     if args.bar_height <= 0:
         parser.error("--bar-height must be > 0")
-    if (args.plot or args.horizontal_bar) and not args.gas_file:
-        parser.error("--gas-file is required")
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
+    if (args.collect_gas or args.plot or args.horizontal_bar) and not args.output:
+        parser.error("-o is required")
     return args
 
 
@@ -368,23 +476,36 @@ def main():
     if args.collect_gas:
         collect_block_gas(normalize_endpoint(args.endpoint), blocks, Path(args.output))
         return 0
+    if args.summarize:
+        trace_dir = Path(args.trace_dir)
+        if not trace_dir.is_dir():
+            print(f"No such trace directory: {trace_dir}", file=sys.stderr)
+            return 1
+        summarize_blocks(
+            normalize_endpoint(args.endpoint),
+            trace_dir,
+            Path(args.data_dir),
+            Path(args.summary_dir),
+            blocks,
+            args.jobs,
+            args.resume,
+        )
+        return 0
 
-    trace_dir = Path(args.trace_dir)
-    if not trace_dir.is_dir():
-        print(f"No such trace directory: {trace_dir}", file=sys.stderr)
-        return 1
-    counts, gas, txs = scan_opcodes(trace_dir, blocks)
+    summary = load_summary(Path(args.summary_dir), blocks, args.call_gas)
+    counts, gas = summary["counts"], summary["gas"]
     if not counts:
         print("No opcode steps found", file=sys.stderr)
         return 1
-    block_gas = load_block_gas(Path(args.gas_file), blocks)
-    print(f"  txs {txs}  blocks {len(blocks)}")
+    print(f"  txs {summary['analysis_txs']}  blocks {len(blocks)}  call-gas {args.call_gas}")
     if args.horizontal_bar:
         plot_bars(
-            counts, gas, block_gas, Path(args.output), args.top, args.font_size, args.width, args.bar_height
+            counts, gas, summary["denom"], Path(args.output), args.top, args.font_size, args.width, args.bar_height
         )
     else:
-        plot_pies(counts, gas, block_gas, Path(args.output), args.top, args.font_size, args.width, args.height)
+        plot_pies(counts, gas, summary["denom"], Path(args.output), args.top, args.font_size, args.width, args.height)
+    print(f"transactions {summary['all_txs']}  gas used {summary['all_gas']}")
+    print(f"analysis transactions {summary['analysis_txs']}  analysis gas {summary['denom']}")
     return 0
 
 
