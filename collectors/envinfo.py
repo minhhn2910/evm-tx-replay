@@ -12,13 +12,14 @@ from utils.collect_env import collect_env
 from utils.collect_pre import collect_pre
 
 
-def collect_envinfo(transaction_hash, endpoint="http://localhost:8545"):
+def collect_envinfo(transaction_hash, endpoint="http://localhost:8545", arena=None):
     """
     Collect environment information for a transaction.
 
     Args:
         transaction_hash: The transaction hash to collect data for
         endpoint: RPC endpoint URL (default: localhost:8545)
+        arena: Already collected trace arena, to avoid a second cast run
 
     Returns:
         Dictionary containing transaction environment information
@@ -28,7 +29,7 @@ def collect_envinfo(transaction_hash, endpoint="http://localhost:8545"):
     transaction["secretKey"] = "0x45a915e4d060149eb4365960e6a7a45f334393093061116b197e3240065ff2d8"
 
     block_env = collect_env(block_num, endpoint)
-    pre_dict = collect_pre(transaction_hash, block_num, endpoint)
+    pre_dict = collect_pre(transaction_hash, block_num, endpoint, trace_list=arena)
 
     # Post value remains unchanged
     post_value = {
