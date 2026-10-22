@@ -16,9 +16,9 @@ Two inputs:
 | Script | Reads | Writes |
 | --- | --- | --- |
 | `data_analysis.py` | fast traces | storage-distance and STATICCALL histograms (PDF + JSON) |
-| `gas_sharing_analysis.py` | fast traces, full traces, optional RPC | text report and optional JSON of cache savings |
-| `combined_data_analysis.py` | full traces, fast traces, RPC, then the summary | `opcode_summary/` and opcode charts (PDF) |
-| `tx_opcode_summary.py` | one transaction | the per-transaction record used by the summarizer. Not a CLI |
+| `gas_sharing_analysis.py` | `opcode_summary/` (`txs.jsonl`, `block.json`) | text report and optional JSON of cache savings |
+| `tx_opcode_summary.py` | full traces, fast traces, RPC | `opcode_summary/` (`block.json`, `txs.jsonl`) |
+| `combined_data_analysis.py` | `opcode_summary/` | opcode frequency and gas bars (PDF) |
 
 ## Fast-trace reports (`data_analysis.py`)
 
@@ -36,49 +36,34 @@ Both modes write `<prefix>.pdf` and `<prefix>.json`. `--data-dir` defaults to `b
 ## Gas sharing (`gas_sharing_analysis.py`)
 
 ```bash
-python gas_sharing_analysis.py --start-block 24000000,24100000 --range 5 -o gas_sharing.json
+python gas_sharing_analysis.py --summary-dir opcode_summary \
+  --start-block 24000000,24100000 --range 5 -o gas_sharing.json
 ```
 
-This estimates an ideal cache. It does not model state invalidation. The cache is empty at the start of each interval, so a short range understates cross-transaction hits. Transaction order inside a block is collection mtime, not header order.
+This reads `txs.jsonl` and `block.json` for storage and hashing, and `block_result/<block>/<tx>/txCalls.json` for static calls. It does not re-read the full trace and it does not call RPC. The cache is empty at the start of each interval. An old summary is enough: static-call frame gas comes from fast mode.
 
-**Static calls** come from `txCalls.json`.
+**Static calls** use one cache: the first `(to, input, output)` pays full gas, and a later identical triple is a hit. Saved gas is that frame’s `gasUsed` — the whole call, including the opcodes inside it — minus `--cache-hit-cost` (default 3). A hit does not descend into that frame. Frames with `error` are not hits. Static-call gas in the denominator is the `gasUsed` of a `STATICCALL` that is not itself nested in a `STATICCALL`. `--data-dir` defaults to `block_result`.
 
-- Case A: an ideal cross-transaction cache. The first time a `(to, input, output)` triple is seen, it pays full gas. A later identical triple is a hit.
-- Case C: only a consecutive repeat of the same output for the same `(to, input)`.
+**Storage and hashing** use `(c, slot)` for SLOAD and SSTORE, and `output` for KECCAK256. A repeat is a key seen earlier in the interval. Same-transaction warm means it was seen earlier in this transaction. There is no access-list model. An SLOAD saves `max(0, g - --warm-cost)` on an interval hit that is not already warm in the transaction (`--warm-cost` default 100). An SSTORE saves `max(0, g - --sstore-warm-cost)` on every interval hit (`--sstore-warm-cost` default 100). KECCAK256 saves `max(0, g - --cache-hit-cost)` when its output was already seen.
 
-Call gas is the exclusive gas of every non-root frame (`gasUsed` minus children, clamped at 0). Static-call gas is the inclusive `gasUsed` of an outermost `STATICCALL`. A hit does not descend into that subtree. Frames with `error` are never hits. A hit is charged `--cache-hit-cost` (default 3) instead of the real gas.
+Block gas defaults to the sum of receipt `gasUsed`. `--ignore-simple` drops simple transfers (the `simple` flag, or `gasUsed == 21000`) from that denominator. On the two-block summary that is `denomGas`, 83,356,938 instead of 85,521,218. `block.json` supplies `gasUsed`, tx count, simple txs, and `denomGas`; the script checks that the tx records sum to `gasUsed`.
 
-**Storage and hashing** come from `txTraceEIP3155.json`. The key is `(contract, slot)`, not the slot alone. `CALL` / `STATICCALL` switch the contract to the target. `DELEGATECALL` / `CALLCODE` keep the current contract. `CREATE` / `CREATE2` get a placeholder.
+Savings are not additive. A hash inside a cached static call is counted by both.
 
-Two notions of “already warm”, reported side by side:
+## Opcode frequency and gas
 
-- `count`: a repeat is a key seen earlier in the interval. Same-transaction warm means it was seen earlier in this transaction.
-- `evm`: also treats an access as warm when the opcode’s `gasCost` is already the warm price (this includes EIP-2930 access-list pre-warming).
-
-An SLOAD saves `max(0, gasCost - --warm-cost)` on an interval hit that is not already warm in the transaction (`--warm-cost` default 100). An SSTORE saves `max(0, gasCost - --sstore-warm-cost)` on every interval hit, including an SSTORE that follows an SLOAD of the same key in the same transaction (`--sstore-warm-cost` default 100). That is an ideal skip of the write, not EIP-2929’s 2100 surcharge. KECCAK256 (`op` 0x20) saves `max(0, gasCost - --cache-hit-cost)` when the next step’s hash was already seen. The script also reports the share of SLOAD and SSTORE repeats whose previous access was in the same block.
-
-Block gas for this script is the sum of callTracer root `gasUsed` (receipt gas, after refunds). `--endpoint` (default `http://localhost:8545`, empty string skips it) checks that against the header.
-
-Savings are not additive. A hash inside a cached static call is counted in both. Call-tracer `gasUsed` does not include the caller’s cold/warm account access or memory expansion, so static-call savings are a lower bound.
-
-## Opcode frequency and gas (`combined_data_analysis.py`)
-
-Two stages. Stage 1 reads each full trace once and writes a small summary. Stage 2 only reads that summary, so a different `--start-block` / `--range` does not scan the traces again.
+Two stages. `tx_opcode_summary.py` reads each full trace once and writes a small summary. `combined_data_analysis.py` only reads that summary, so a different `--start-block` / `--range` does not scan the traces again.
 
 ```bash
-python combined_data_analysis.py --summarize \
+python tx_opcode_summary.py \
   --trace-dir raw_block --data-dir block_result \
   --summary-dir opcode_summary \
   --start-block 24000000,24100000 --range 5 --jobs 8
 
-python combined_data_analysis.py --horizontal-bar \
+python combined_data_analysis.py \
   --summary-dir opcode_summary \
   --start-block 24000000 --range 2 --call-gas own \
-  --top 10 --bar-height 0.22 -o opcodes.pdf
-
-python combined_data_analysis.py --plot \
-  --summary-dir opcode_summary \
-  --start-block 24000000 --range 2 --call-gas own -o opcodes.pdf
+  --top 10 -o opcodes.pdf
 ```
 
 `--jobs` is the number of processes (default: CPU count). One transaction per process. `--resume` skips a block that already has both summary files. `--endpoint` is used to read the block’s transaction list and `eth_getBlockReceipts`.
@@ -95,8 +80,8 @@ python combined_data_analysis.py --plot \
   {"op":"SLOAD","i":40,"g":2100,"c":"0xcontract","slot":"0xslot","result":"0xvalue"},
   {"op":"KECCAK256","i":55,"g":42,"output":"0xhash"},
   {"op":"SSTORE","i":80,"g":20000,"c":"0xcontract","slot":"0xslot","pre":"0xold","post":"0xnew"},
-  {"op":"STATICCALL","i":90,"g":100,"to":"0xcallee","input":"0xcalldata","output":"0xreturn"},
-  {"op":"CALL","i":200,"g":2600,"to":"0xtarget"}
+  {"op":"STATICCALL","i":90,"g":100,"d":1,"inside":4200,"direct":2600,"to":"0xcallee","input":"0xcalldata","output":"0xreturn"},
+  {"op":"CALL","i":200,"g":2600,"d":1,"inside":2600,"direct":2600,"to":"0xtarget"}
 ]}
 ```
 
@@ -120,9 +105,7 @@ Opcode percent is opcode gas divided by `denomGas`: receipt `gasUsed` of transac
 
 ### Charts
 
-`--horizontal-bar` draws one row per opcode: frequency on the left, gas share on the right. `--top` (default 10) keeps the opcodes with the most gas under the selected `--call-gas`; everything else is **Other**. Rows are sorted by gas, descending. Each column is scaled to its own maximum, with the percentage beside the bar. `--bar-height` is the row pitch in inches (default 0.22) so the figure stays short enough for a paper. `--width` and `--font-size` adjust the layout.
-
-`--plot` draws two pies: opcode frequency, and opcode gas as a share of `denomGas`. The gas pie leaves an unlabeled gap so each wedge is that share of `denomGas` rather than a share of opcode gas alone. Besides the top `--top` slices, the pies always label SLOAD, SSTORE, KECCAK256, CALL, and STATICCALL when they occur. The legend sits beside the pie.
+The chart is one group per opcode, with the frequency bar directly above the gas bar. `--top` (default 10) keeps the opcodes with the most gas under the selected `--call-gas`; everything else is **Other**. Named opcodes are sorted by gas, descending, and **Other** is always the bottom group. Frequency and gas are scaled to their own maxima, and the percentage is written beside each bar. Figure size, bar spacing, group spacing, colors, hatch, and alpha are the constants at the top of `combined_data_analysis.py`. `--ignore-calls` drops `CALL`, `STATICCALL`, `DELEGATECALL`, and `CALLCODE`. Their gas is subtracted from the gas denominator and is not added to **Other**. `CREATE` and `CREATE2` stay.
 
 The last lines of a plot run are the full block totals and the non-simple totals used as the denominator.
 
@@ -132,16 +115,4 @@ The last lines of a plot run are the full block totals and the non-simple totals
 
 `staticcall frames unmatched` is the number of `STATICCALL` opcodes that could not be paired with the next `STATICCALL` frame in `txCalls.json`, so they have no `input` or `output`. Zero means every static call was paired.
 
-## Header gas only (`--collect-gas`)
-
-```bash
-python combined_data_analysis.py --collect-gas \
-  --start-block 24000000,24100000 --range 5 \
-  --endpoint http://localhost:8545 -o block_gas.json
-```
-
-This writes `{block: {"gasUsed", "txs"}}` from `eth_getBlockByNumber` and prints the totals. The opcode pipeline does not need this file. `--summarize` reads receipts itself.
-
-## What is not wired yet
-
-`gas_sharing_analysis.py` still reads `txCalls.json` and `txTraceEIP3155.json` directly. `txs.jsonl` has the ordered SLOAD, SSTORE, KECCAK256, and call records that a later sharing pass can use instead of the full trace. That pass has not been switched over.
+Call ops also store `d` (trace depth), `inside` (net gas until the call returns), and `direct` (the part of that window that is not inside a nested call). `error` is set when the paired fast-mode frame reverted. `gas_sharing_analysis.py` uses those fields.
